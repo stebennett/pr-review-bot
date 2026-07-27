@@ -1710,6 +1710,74 @@ class Context:
         self.root: Path | None = None
 
 
+# `#42`, `Closes #42`, and full issue/PR URLs including cross-repo ones. The
+# negative lookbehind keeps hex colours and anchors from parsing as references.
+ISSUE_REF_RE = re.compile(
+    r"https?://github\.com/(?P<orepo>[\w.-]+/[\w.-]+)/(?:issues|pull)/(?P<onum>\d+)"
+    r"|(?<![\w#])#(?P<num>\d{1,7})\b"
+)
+MAX_LINKED_ISSUES = 5
+
+
+def issue_refs(text: str, repo: str) -> list[tuple[str, int]]:
+    """(repo, number) pairs referenced by `text`, deduplicated, first-seen order."""
+    out: list[tuple[str, int]] = []
+    for m in ISSUE_REF_RE.finditer(text or ""):
+        ref = (m.group("orepo"), int(m.group("onum"))) if m.group("orepo") else (repo, int(m.group("num")))
+        if ref not in out:
+            out.append(ref)
+    return out[:MAX_LINKED_ISSUES]
+
+
+def resolve_requirements(gh, repo: str, pr: dict, acc: Accounting) -> str:
+    """The PR body plus its linked issues and any human conversation comments.
+
+    Requirements resolution was `pr.get("body")`, which meant the requirements lens
+    judged conformity against whatever the author chose to write. This is the one
+    pack part that also reaches the adjudicator, exactly as the plain body does
+    today — see doctrine/agents/pr-review-verdict.md.
+
+    Every GitHub failure degrades to what we already had. A thinner requirements
+    string is worth far more than a failed review.
+    """
+    body = (pr.get("body") or "").strip()
+    parts = [body] if body else ["(none stated — judge against the PR title alone)"]
+
+    if gh is not None:
+        for ref_repo, number in issue_refs(f"{pr.get('title', '')}\n{body}", repo):
+            try:
+                issue = gh.get(f"/repos/{ref_repo}/issues/{number}")
+            except Exception as exc:  # noqa: BLE001
+                vlog(f"    context: could not fetch {ref_repo}#{number}: {exc}")
+                continue
+            parts.append(
+                f"### Linked issue {ref_repo}#{number}: {issue.get('title', '')}\n"
+                f"{(issue.get('body') or '(empty)').strip()}"
+            )
+
+        try:
+            comments = gh.get(f"/repos/{repo}/issues/{pr['number']}/comments")
+        except Exception as exc:  # noqa: BLE001
+            vlog(f"    context: could not fetch PR comments: {exc}")
+            comments = []
+        human = [
+            c for c in comments
+            if (c.get("user") or {}).get("type") != "Bot"
+            and not ((c.get("user") or {}).get("login", "")).endswith("[bot]")
+        ]
+        if human:
+            rendered = "\n\n".join(
+                f"**{(c.get('user') or {}).get('login', '?')}**: {(c.get('body') or '').strip()}"
+                for c in human
+            )
+            parts.append(
+                "### Human comments on this PR\n"
+                "Requirements as stated by people, not by the description.\n\n" + rendered
+            )
+
+    return acc.add("requirements", "\n\n".join(parts))
+
+
 @contextmanager
 def build_context(
     gh: GitHub | None,
@@ -1752,6 +1820,7 @@ def build_context(
 
         try:
             acc = Accounting(budgets(cfg["max_context_chars"]))
+            ctx.requirements = resolve_requirements(gh, repo, pr, acc)
             sections: list[str] = []
             ranges = diff_paths(diff)
             sections.append(pack_changed_files(
