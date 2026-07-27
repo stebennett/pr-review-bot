@@ -578,9 +578,9 @@ def run_lens(
     return openrouter(model, system, user, LENS_SCHEMA, label=f"lens:{lens}")
 ```
 
-- [ ] **Step 6: Update the two call sites to pass an empty pack**
+- [ ] **Step 6: Update the one call site to pass an empty pack**
 
-The pack does not exist until Task 9. In `run_panel`, the `pool.submit` call becomes:
+`run_lens` is called from exactly one place — `run_panel`'s `pool.submit`. The pack does not exist until Task 9, so `""` is correct here and Task 9 replaces it. In `run_panel`, the call becomes:
 
 ```python
             pool.submit(run_lens, lens, pr, repo, diff, requirements, "", opts.model_lens): lens
