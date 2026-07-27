@@ -661,6 +661,155 @@ class TestPackChangedFiles(unittest.TestCase):
         self.assertLessEqual(len(out), acc.limits["changed_files"])
         self.assertNotIn("changed_files", acc.truncated)
 
+    def test_the_busiest_file_outranks_a_crowd_of_trivial_ones_for_a_place(self):
+        # Round-5 regression, and the whole point of ordering by hunk count.
+        # Choosing a single evictee — even "the cheapest eviction that ends the
+        # overflow" — can only ever remove ONE file, so when no individual
+        # trivial file covers the overflow the one big file does, and the
+        # most-changed file in the PR is dropped in favour of twenty files with
+        # one trivial hunk each. Measured at the production budget before the
+        # fix: A_core.py dropped, all 20 trivial files shown, 43.4% used.
+        # Admission in priority order keeps A_core and turns away the tail.
+        files = {"A_core.py": "\n".join(f"core{i}" + "y" * 44 for i in range(1, 901)) + "\n"}
+        ranges = {"A_core.py": [(50, 130), (200, 280), (350, 430),
+                                (500, 580), (650, 730), (800, 880)]}
+        for i in range(20):                       # one hunk each: lowest priority
+            name = f"z{i:02d}.py"
+            files[name] = "\n".join(f"z{i:02d}line{j:02d}" for j in range(1, 61)) + "\n"
+            ranges[name] = [(1, 60)]              # whole body touched: unshrinkable
+        make_tree(self.root, files)
+        acc = self.acc(limit=39840)               # the real production budget
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+
+        self.assertIn("### A_core.py\n", out)                 # the busiest file survives
+        self.assertNotIn("- A_core.py", out)                  # and is not in any drop list
+        dropped = [ln[2:] for ln in out.splitlines() if ln.startswith("- ")]
+        self.assertTrue(dropped, "the fixture must not fit whole, or it proves nothing")
+        # Whatever was turned away is a tail of the priority order: the trivial
+        # files, lowest-ranked first, never something from the front.
+        self.assertEqual(dropped, sorted(f"z{i:02d}.py" for i in range(20))[-len(dropped):])
+        self.assertGreaterEqual(acc.used["changed_files"], 0.85 * acc.limits["changed_files"])
+        self.assertLessEqual(len(out), acc.limits["changed_files"])
+        self.assertNotIn("changed_files", acc.truncated)
+
+    def test_an_unshrinkable_file_yields_its_place_to_the_smaller_files_behind_it(self):
+        # The counter-case the rule above must not regress, modelled on the
+        # real PR: seven shrinkable code files, then review.md whose diff
+        # touches all of its own body (so no window shrinks it and it cannot be
+        # admitted at its turn), then test.md sorting behind it. Strict
+        # reverse-priority eviction takes test.md first and ends at eight
+        # files; the unshrinkable one has to be the one that goes.
+        files, ranges = {}, {}
+        for i in range(7):
+            name = f"src/code{i}.ts"
+            files[name] = "\n".join(f"code{i} line {j} " + "z" * 30 for j in range(1, 121)) + "\n"
+            ranges[name] = [(10, 40), (70, 100)]  # two hunks: shrinkable, higher priority
+        files["docs/review.md"] = "\n".join(f"review line {j} " + "w" * 55 for j in range(1, 301)) + "\n"
+        ranges["docs/review.md"] = [(1, 300)]     # the entire body
+        files["docs/test.md"] = "\n".join(f"test line {j}" for j in range(1, 33)) + "\n"
+        ranges["docs/test.md"] = [(1, 32)]
+        make_tree(self.root, files)
+        acc = self.acc(limit=39840)
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+
+        self.assertIn("### 1 further changed file(s) not shown (budget)\n- docs/review.md", out)
+        self.assertIn("### docs/test.md\n", out)              # the small file behind it survives
+        self.assertIn("1: test line 1\n", out)
+        for i in range(7):
+            self.assertIn(f"### src/code{i}.ts\n", out)
+        self.assertGreaterEqual(acc.used["changed_files"], 0.85 * acc.limits["changed_files"])
+        self.assertLessEqual(len(out), acc.limits["changed_files"])
+        self.assertNotIn("changed_files", acc.truncated)
+
+    def test_utilisation_holds_on_a_non_uniform_mix_of_sizes_and_hunk_counts(self):
+        # The sweep above uses identical files, which is exactly why the
+        # eviction defect passed it green: with uniform bodies the survivors
+        # inflate to whole and utilisation stays near 100% no matter WHICH
+        # files survive. Here sizes span 25 to 3000 lines and hunk counts 1 to
+        # 6, some diffs cover a file's whole body and some a sliver of it, so
+        # priority order, shrinkability and size all disagree with each other.
+        sizes = [3000, 25, 480, 120, 60, 1500, 200, 45, 900, 75, 340, 30]
+        files, ranges = {}, {}
+        for i, n in enumerate(sizes):
+            name = f"pkg{i % 3}/mod{i:02d}.py"
+            files[name] = "\n".join(f"m{i:02d} line {j} " + "q" * (i * 3 % 40)
+                                    for j in range(1, n + 1)) + "\n"
+            if i % 4 == 3:
+                ranges[name] = [(1, n)]                     # whole body: unshrinkable
+            else:
+                hunks = 1 + i % 6
+                step = max(2, n // (hunks + 1))
+                ranges[name] = [(k * step, min(n, k * step + 4)) for k in range(1, hunks + 1)]
+        make_tree(self.root, files)
+        acc = self.acc(limit=39840)
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+        limit = acc.limits["changed_files"]
+        self.assertLessEqual(len(out), limit)
+        self.assertNotIn("changed_files", acc.truncated)
+        self.assertGreaterEqual(
+            acc.used["changed_files"], 0.85 * limit,
+            f"used {acc.used['changed_files']} of {limit} "
+            f"({100.0 * acc.used['changed_files'] / limit:.1f}%)")
+
+    def test_the_section_keeps_the_highest_priority_files_that_fit(self):
+        # The other half of Finding 7, and the general form of it. A file is
+        # turned away by comparing the section against the trailer AS IT STANDS
+        # AT THE TIME, and every later refusal lengthens that trailer — so a
+        # file can be refused for room that is handed back afterwards, and the
+        # give-back takes the largest file it can, which walks DOWN from the top
+        # of the priority order. Before the fix this fixture at a 3000-char
+        # budget showed the busiest file plus the three LOWEST-priority filler
+        # files, dropping ranks 1 through 16 outright.
+        #
+        # Asserted as the optimality condition rather than a hand-read expected
+        # list: for every file named as budget-dropped, keeping it instead —
+        # alongside every higher-priority file that was kept, and sacrificing
+        # every lower-priority one — must genuinely not fit. That is exactly
+        # what admitting in priority order guarantees, and it is violated by any
+        # rule that drops a high-priority file a cheaper sacrifice would have
+        # saved.
+        files, ranges = {}, {}
+
+        def add(name, n_lines, width):
+            files[name] = "\n".join(f"{name[-9:]} line {j} " + "v" * width
+                                    for j in range(1, n_lines + 1)) + "\n"
+            ranges[name] = [(1, n_lines)]     # whole body: unshrinkable, so the
+            #                                   floor is the only rendering
+        add("pkg/r00_tiny_but_busiest.py", 6, 20)          # rank 0, cheap
+        add("pkg/r01_bulky_unshrinkable.py", 40, 45)       # rank 1, the give-back's target
+        add("pkg/r02_medium_unshrinkable.py", 16, 42)      # rank 2, refused early
+        for i in range(18):
+            add(f"pkg/r{i + 3:02d}_filler_padding_name.py", 12, 18)
+        make_tree(self.root, files)
+
+        chosen = sorted(ranges, key=lambda p: (-len(ranges[p]), p))[:25]
+        floors = {r: review._file_tiers(r, files[r], ranges[r])[0][1] for r in chosen}
+        for limit in (2500, 3000, 3500, 5000, 8000):
+            with self.subTest(limit=limit):
+                acc = self.acc(limit=limit)
+                out = review.pack_changed_files(
+                    self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+                self.assertLessEqual(len(out), limit)
+                self.assertNotIn("changed_files", acc.truncated)
+                header = out.split("### ")[0]
+                shown = [ln[4:] for ln in out.splitlines()
+                         if ln.startswith("### ") and ln.endswith(".py")]
+                self.assertTrue(shown, "nothing shown; the fixture proves nothing")
+                for d in [r for r in chosen if r not in shown]:
+                    rank = chosen.index(d)
+                    keep = [r for r in chosen
+                            if r in shown and chosen.index(r) < rank] + [d]
+                    keep.sort(key=chosen.index)
+                    drop = [r for r in chosen if r not in keep]
+                    groups = review._trailer_groups([], [], drop, with_names=True)
+                    sizes = [len(floors[r]) for r in keep] + [len(g) for g in groups]
+                    counterfactual = len(header) + sum(sizes) + max(0, len(sizes) - 1)
+                    self.assertGreater(
+                        counterfactual, limit,
+                        f"limit={limit}: {d} (rank {rank}) was dropped, but keeping "
+                        f"it and sacrificing every lower-priority file fits in "
+                        f"{counterfactual} of {limit}")
+
     def test_a_tiny_budget_with_a_long_dropped_file_list_does_not_truncate(self):
         # Folded-in Minor: the trailer-shrink loop used to exit unconditionally
         # once shown_parts was empty, even if header + trailer alone still

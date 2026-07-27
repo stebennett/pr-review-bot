@@ -1008,33 +1008,69 @@ def pack_changed_files(
         texts[rel] = read_source(root, gh, repo, sha, rel)
         tiers[rel] = _file_tiers(rel, texts[rel], ranges[rel])
 
-    shown = list(chosen)                                   # stays in priority order
+    shown: list[str] = []                                  # stays in priority order
     rung = {rel: 0 for rel in chosen}
     bodies = {rel: tiers[rel][0][1] for rel in chosen}
     budget_dropped: list[str] = []
 
-    def measure(with_names: bool = True) -> int:
+    def measure() -> int:
         """What the section would come to right now — bodies, trailer and the
         newlines `"\\n".join` puts between them — without building it."""
-        groups = _trailer_groups(ignored, cap_dropped, budget_dropped, with_names=with_names)
+        groups = _trailer_groups(ignored, cap_dropped, budget_dropped, with_names=True)
         sizes = [len(bodies[r]) for r in shown] + [len(g) for g in groups]
         return len(header) + sum(sizes) + max(0, len(sizes) - 1)
 
-    # 1. Make the floor fit, by evicting whole files. The evictee is the
-    #    lowest-priority file whose own body covers the overflow — the cheapest
-    #    single eviction that ends the problem, taken as far down the priority
-    #    order as it can be. When no one file covers the overflow, the largest
-    #    goes: no single eviction can end it, so freeing the most room ends it
-    #    soonest. That ordering matters — a file whose diff touches its entire
-    #    body cannot be windowed at all, and evicting it is often the only way
-    #    the several genuinely shrinkable files behind it get shown at all.
+    # 1. Make the floor fit, by admitting whole files in priority order and
+    #    turning away the ones that no longer fit — never a half-rendered file,
+    #    and everything turned away is named.
+    #
+    #    Admitting in priority order is what makes this right, and the reason
+    #    is worth stating: it keeps the highest-priority file it possibly can,
+    #    then the next, and so on, so the set it ends up with is the best one
+    #    available in priority terms. Choosing an evictee instead — even the
+    #    "cheapest eviction that ends the overflow" — only ever considers
+    #    removing ONE file, so when no single small file covers the overflow
+    #    the one large file does, and the busiest file in the pull request gets
+    #    dropped in favour of twenty files with one trivial hunk each. That is
+    #    precisely backwards: hunk count orders these files because the
+    #    most-changed file is the most useful thing a reviewer can be shown.
+    #    Admission also handles the case that motivated the old rule without
+    #    needing a special case for it — a file whose diff touches its entire
+    #    body cannot be windowed, so it is simply too big to admit at its turn,
+    #    and the shrinkable files behind it are admitted in its place.
+    for rel in chosen:
+        shown.append(rel)
+        if measure() > budget:
+            shown.pop()
+            budget_dropped.append(rel)
+    # Each later refusal adds a line to the trailer, which can put an already
+    # admitted section back over by a few dozen characters. Give back from the
+    # bottom of the priority order until it fits; every file handed back frees
+    # more than the bullet naming it costs, so this cannot spin.
     while shown and measure() > budget:
-        overflow = measure() - budget
-        solvers = [r for r in shown if len(bodies[r]) >= overflow]
-        victim = solvers[-1] if solvers else max(shown, key=lambda r: len(bodies[r]))
-        shown.remove(victim)
-        budget_dropped.append(victim)
+        budget_dropped.append(shown.pop())
     budget_dropped.sort(key=chosen.index)
+
+    # Every refusal above was judged against the trailer as it stood at the
+    # time, and each later refusal lengthened it — so a file turned away early
+    # may have been turned away for room that the give-back has since handed
+    # back, and naming a file in the trailer is far cheaper than showing it.
+    # Offer what is left to the refused files in priority order until nobody
+    # else fits. Each round only ever moves a file from the drop list into the
+    # section, and never the other way, so this settles.
+    readmitted = True
+    while readmitted:
+        readmitted = False
+        for rel in list(budget_dropped):
+            budget_dropped.remove(rel)
+            shown.append(rel)
+            shown.sort(key=chosen.index)
+            if measure() <= budget:
+                readmitted = True
+            else:
+                shown.remove(rel)
+                budget_dropped.append(rel)
+        budget_dropped.sort(key=chosen.index)
 
     # 2. Upgrade greedily, highest priority first, restarting the scan after
     #    every upgrade so the busiest file keeps first claim on what is left.
