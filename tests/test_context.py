@@ -457,6 +457,66 @@ class TestPackChangedFiles(unittest.TestCase):
         self.assertIn("250: line250", out_windowed)
         self.assertIn("251: line251", out_windowed)
 
+    def test_a_small_file_is_still_shown_when_a_bigger_one_sorts_ahead_and_cannot_fit(self):
+        # Round-2 regression: round 1 stopped assembly entirely on the first
+        # file that didn't fit, dropping every file behind it in priority
+        # order too — even ones, like this small file, that would easily
+        # have fit the room the big one could not use. aaa_huge.py sorts
+        # first (tied hunk count, earlier alphabetically) and cannot fit even
+        # fully windowed down; zzz_small.py must still get its own chance.
+        huge_lines = "\n".join(f"line{i}" for i in range(1, 3001))  # 3000 lines
+        make_tree(self.root, {
+            "aaa_huge.py": huge_lines + "\n",
+            "zzz_small.py": "alpha\nbeta\ngamma\n",
+        })
+        ranges = {"aaa_huge.py": [(1, 3000)], "zzz_small.py": [(1, 3)]}
+        acc = self.acc(limit=5000)
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+        self.assertIn("### zzz_small.py\n```\n1: alpha\n2: beta\n3: gamma\n```\n", out)
+        self.assertIn("### 1 further changed file(s) not shown (budget)\n- aaa_huge.py", out)
+        self.assertLessEqual(len(out), acc.limits["changed_files"])
+        self.assertNotIn("changed_files", acc.truncated)
+
+    def test_the_section_uses_a_substantial_fraction_of_its_budget(self):
+        # Round 1's stop-on-first-miss left roughly a third of a real
+        # section's budget unused (67% utilisation on an actual PR) once one
+        # oversized file stopped assembly and took every file behind it down
+        # with it. The 85% floor here is set specifically high enough that
+        # round 1's behaviour would have failed it.
+        huge_lines = "\n".join(f"line{i}" for i in range(1, 3001))
+        files = {"aaa_huge.py": huge_lines + "\n"}
+        ranges = {"aaa_huge.py": [(1, 3000)]}
+        body = "\n".join(f"line{i}" for i in range(1, 101)) + "\n"  # ~1 KB whole, numbered
+        for i in range(5):
+            name = f"m{i}.py"
+            files[name] = body
+            ranges[name] = [(1, 1)]
+        make_tree(self.root, files)
+        acc = self.acc(limit=6000)
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+        self.assertGreaterEqual(acc.used["changed_files"], 0.85 * acc.limits["changed_files"])
+        self.assertLessEqual(len(out), acc.limits["changed_files"])
+        self.assertNotIn("changed_files", acc.truncated)
+
+    def test_a_file_over_its_cap_by_raw_size_is_windowed_in_not_dropped(self):
+        # The specific round-1 regression: review.md in the real PR was
+        # 21,343 raw chars against a 6,618 cap, but its ±60-padded window was
+        # only 4,250 chars — comfortably fittable. A file must be judged on
+        # what it actually renders to, never on raw size, so it is included
+        # windowed rather than treated as unfittable.
+        lines = "\n".join(f"line{i}" for i in range(1, 2001))  # 2000 lines, large raw
+        make_tree(self.root, {"review.md": lines + "\n", "test.md": "alpha\nbeta\n"})
+        ranges = {"review.md": [(1000, 1001)], "test.md": [(1, 2)]}
+        acc = self.acc(limit=6000)
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+        self.assertIn("### review.md", out)
+        self.assertIn("elided", out)
+        self.assertIn("1000: line1000", out)
+        self.assertIn("### test.md\n```\n1: alpha\n2: beta\n```\n", out)
+        self.assertNotIn("not shown (budget)", out)
+        self.assertLessEqual(len(out), acc.limits["changed_files"])
+        self.assertNotIn("changed_files", acc.truncated)
+
 
 if __name__ == "__main__":
     unittest.main()

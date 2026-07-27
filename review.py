@@ -875,12 +875,16 @@ def pack_changed_files(
 ) -> str:
     """Every changed file at head, whole where it fits and windowed where it does not.
 
-    Assembly is greedy and self-limiting: each file's cap is recomputed from
-    whatever budget the files ahead of it left behind, and a file that still
-    would not fit — even after every windowing stage — stops the run rather
-    than being handed to Accounting to slice mid-line. That is the whole
-    point: `acc.add` truncating this section at a raw offset would cut a file
-    body in half, which is worse than dropping the file cleanly and naming it.
+    Assembly is greedy, self-limiting, and skip-not-stop: each file's cap is
+    recomputed from whatever budget the files ahead of it left behind, the
+    fit decision is made on the actual rendered (wrapped, windowed) string —
+    never on raw file size — and a file that does not fit even at its
+    tightest windowing is skipped, not treated as end-of-budget. A large
+    file sorting ahead of a small one must not cost the small one its place:
+    the small file gets its own chance at whatever room remains. Nothing is
+    ever handed to `Accounting` in a state that could still overrun, because
+    `acc.add` truncating this section at a raw offset would cut a file body
+    in half, which is worse than dropping the file cleanly and naming it.
     """
     if not ranges:
         return ""
@@ -907,8 +911,15 @@ def pack_changed_files(
     budget_dropped: list[str] = []
     pending = list(chosen)
     while pending:
-        rel = pending[0]
-        cap = max(0, remaining // len(pending))
+        if remaining <= 0:
+            # Nothing left to spend and every body costs at least a few
+            # characters of wrapper, so every remaining file is unfittable —
+            # stopping here is a real end-of-budget, not the priority-order
+            # stop this task removed.
+            budget_dropped.extend(pending)
+            break
+        rel = pending.pop(0)
+        cap = max(0, remaining // (len(pending) + 1))
         text = read_source(root, gh, repo, sha, rel)
         if text is None:
             body = f"### {rel}\n(skipped: unreadable, binary, or over {MAX_SOURCE_BYTES} bytes)\n"
@@ -918,14 +929,12 @@ def pack_changed_files(
             shown_files.append(rel)
             shown_parts.append(body)
             remaining -= len(body)
-            pending.pop(0)
         else:
-            # This file — and everything behind it in priority order — does
-            # not fit what is left. Stop here rather than trying smaller
-            # files out of order, which would make "what got shown" depend on
-            # file size instead of the hunk-count priority already promised.
-            budget_dropped = pending
-            break
+            # Even this file's tightest windowing does not fit what is left.
+            # Skip it and keep going — a smaller file later in priority order
+            # may still fit the room this one could not, and must get the
+            # chance regardless of what sorted ahead of it.
+            budget_dropped.append(rel)
 
     # The trailer itself costs characters. If it pushes the total over budget,
     # give back the lowest-priority shown file (which is worth far more than
