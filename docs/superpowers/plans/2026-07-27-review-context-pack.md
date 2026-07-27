@@ -1193,7 +1193,14 @@ def diff_anchors(diff: str) -> set[tuple[str, int, str]]:
     return anchors
 ```
 
-Note: `_hunks` uses `yield from flush()` where `flush` is itself a generator, so the final hunk is emitted after the loop ends.
+Note: `_hunks` accumulates into a list and calls a `close()` helper, including once after the loop so the final hunk is emitted.
+
+**Two defects in the code block above were found in review and fixed in `c7d5ea4`. The shipped code differs from this block; the shipped code is correct.**
+
+1. **`diff --git ` must close the pending hunk** and reset `header`, not merely `continue`. A file entry with no `---`/`+++ ` lines — a pure rename, a mode-only change, a binary file, or the `new file mode 100644` line that precedes `--- /dev/null` on an added file — otherwise leaks its metadata lines into the *previous* file's still-open hunk as context, inflating that file's ranges and fabricating anchors for lines that do not exist. This was live on the real test diff: 7 of its 737 anchors were fabricated, from 5 added files.
+2. **Hunk-body lines beginning with `\`** (the `\ No newline at end of file` marker) must be ignored where the body is collected, so `diff_paths` and `diff_anchors` agree. Otherwise the marker counts as a context line on both sides.
+
+Both were over-generation bugs, and the original tests could not catch them: ten of the eleven anchor assertions used `assertIn`, which detects a missing anchor but never a spurious extra one. **Anchor tests must assert set equality.**
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
