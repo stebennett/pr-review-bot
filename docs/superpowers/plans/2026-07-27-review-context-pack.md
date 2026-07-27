@@ -37,6 +37,7 @@ This repo has no test suite today and `CLAUDE.md` says so. This plan adds one, b
   python3 -m unittest discover -s tests -t . -v
   ```
   The `-t .` sets the top-level directory to the repo root so `import review` resolves.
+- **`tests/__init__.py` must exist and be empty.** With `-t .`, `unittest discover` requires the start directory to be an importable package and fails with `ImportError: Start directory is not importable` without it — verified on 3.9 and 3.14. Task 2 creates it.
 - No network in any test. GitHub and OpenRouter are stubbed with hand-written fakes.
 - Tests locate `doctrine/` relative to `review.__file__`, never relative to cwd.
 
@@ -47,7 +48,8 @@ Model-calling paths (`openrouter`, `run_lens` end to end, `adjudicate`) are **no
 | File | Responsibility |
 |---|---|
 | `review.py` | All production code. New banner section `# Context pack` between "Selection and triage" and "The pass". Modifications to `openrouter`, `run_lens`, `run_panel`, `review_pr`, `review_diff_file`, `build_parser`, `DEFAULTS`. |
-| `tests/test_prompting.py` | `seg`, `completion_payload`, `build_lens_prompt` block structure and cacheability, `dispatch_lenses` ordering and concurrency. |
+| `tests/__init__.py` | Empty. Makes `tests` an importable package, which `unittest discover -t .` requires. |
+| `tests/test_prompting.py` | `seg`, `completion_payload`, `strip_fence`, `build_lens_prompt` block structure and cacheability, `dispatch_lenses` ordering and concurrency. |
 | `tests/test_diff.py` | `diff_paths`, `diff_anchors`, `anchor_violations`. |
 | `tests/test_context.py` | `extract_checkout`, budget shares, and the four `pack_*` functions. |
 | `tests/test_requirements.py` | `issue_refs` parsing and `resolve_requirements` assembly. |
@@ -121,7 +123,7 @@ Pure plumbing. `openrouter` currently takes `system` and `user` as strings and b
 
 **Files:**
 - Modify: `review.py` — new `CACHE_ENABLED` global, `seg()`, `_blocks()`, `completion_payload()`; `openrouter()` body at `review.py:364-466`
-- Create: `tests/test_prompting.py`
+- Create: `tests/__init__.py` (empty — required by `unittest discover -t .`), `tests/test_prompting.py`
 
 **Interfaces:**
 - Consumes: nothing
