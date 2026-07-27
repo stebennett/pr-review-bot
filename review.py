@@ -776,7 +776,16 @@ def _hunks(diff: str) -> list[tuple[str | None, str | None, int, int, list[str]]
             )
 
     for line in diff.splitlines():
-        if line.startswith(("diff --git ", "index ")):
+        if line.startswith("diff --git "):
+            # A new file entry closes the previous file's last hunk. Entries
+            # with no `--- `/`+++ ` at all — pure renames, mode-only changes,
+            # binary files — must not let their metadata lines (`similarity
+            # index …`, `rename from …`, `Binary files … differ`) be swallowed
+            # as context into whatever hunk was still open.
+            close()
+            header, body = None, []
+            continue
+        if line.startswith("index "):
             continue
         if line.startswith("--- "):
             # The `---` line opens a new file, so it also closes the previous
@@ -793,7 +802,9 @@ def _hunks(diff: str) -> list[tuple[str | None, str | None, int, int, list[str]]
             close()
             header, body = m, []
             continue
-        if header is not None:
+        if header is not None and not line.startswith("\\"):
+            # `\ No newline at end of file` is neither an added, removed, nor
+            # context line — it must not consume a line number on either side.
             body.append(line)
     close()
     return out
