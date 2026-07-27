@@ -900,7 +900,10 @@ CONTEXT_SHARES = {
 
 
 def budgets(total: int) -> dict[str, int]:
-    return {part: int(total * share) for part, share in CONTEXT_SHARES.items()}
+    # A negative or zero total must behave exactly like an all-zero budget,
+    # never a negative one — Accounting.add() relies on every limit being
+    # non-negative to keep its own guarantee.
+    return {part: max(0, int(total * share)) for part, share in CONTEXT_SHARES.items()}
 
 
 class Accounting:
@@ -908,27 +911,34 @@ class Accounting:
 
     Truncation is always marked in-band: a lens that cannot tell a truncated
     section from a complete one will treat absence as evidence, which is exactly
-    the failure the porting note warns about.
+    the failure the porting note warns about. Only a limit of exactly 0 — which
+    cannot carry so much as a single character of signal — is ever silent.
     """
 
     def __init__(self, limits: dict[str, int]) -> None:
-        self.limits = limits
-        self.used = {part: 0 for part in limits}
+        # budgets() already clamps, but Accounting may be constructed directly
+        # (as the tests do), so a negative limit is clamped here too rather
+        # than trusted.
+        self.limits = {part: max(0, limit) for part, limit in limits.items()}
+        self.used = {part: 0 for part in self.limits}
         self.truncated: set[str] = set()
 
     def add(self, part: str, text: str) -> str:
-        limit = self.limits[part]
+        limit = max(0, self.limits[part])
         if len(text) <= limit:
             self.used[part] = len(text)
             return text
         self.truncated.add(part)
-        # The marker itself costs characters, so at a small enough limit even it
-        # cannot fit — tried in order from most to least informative, falling
-        # all the way to a bare truncation with no marker rather than ever
-        # returning more than `limit` characters.
+        # The marker itself costs characters, so at a small enough limit even
+        # the short marker cannot fit — tried in order from most to least
+        # informative: full sentence, short phrase, a bare ellipsis, and only
+        # at limit 0 (which cannot hold even one character) nothing at all.
+        # Every limit >= 1 must carry *some* in-band signal that truncation
+        # happened, per this class's own contract above.
         full = f"\n\n… truncated: {part} exceeded its {limit}-character budget …\n"
         short = "\n… truncated …\n"
-        for marker in (full, short, ""):
+        minimal = "…"
+        for marker in (full, short, minimal, ""):
             if len(marker) <= limit:
                 break
         out = text[: limit - len(marker)] + marker

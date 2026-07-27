@@ -50,6 +50,12 @@ class TestBudgets(unittest.TestCase):
         for part in review.CONTEXT_SHARES:
             self.assertLess(small[part], large[part])
 
+    def test_a_negative_or_zero_total_never_yields_a_negative_budget(self):
+        for total in (-100, -1, 0):
+            with self.subTest(total=total):
+                for value in review.budgets(total).values():
+                    self.assertGreaterEqual(value, 0)
+
 
 class TestAccounting(unittest.TestCase):
     def test_text_within_budget_passes_through_unchanged(self):
@@ -81,6 +87,35 @@ class TestAccounting(unittest.TestCase):
         acc = review.Accounting({"tree": 40})
         out = acc.add("tree", "x" * 200)
         self.assertEqual(acc.used["tree"], len(out))
+
+    def test_every_limit_from_0_to_80_stays_within_budget_and_is_marked(self):
+        # Swept, not hand-picked: this is exactly the range (roughly 0-15) where
+        # the tiered-marker fallback used to go silent instead of shrinking the
+        # marker further, and neighbouring values (16-80) must keep working too.
+        for limit in range(0, 81):
+            with self.subTest(limit=limit):
+                acc = review.Accounting({"tree": limit})
+                out = acc.add("tree", "CONTENT" * 100)
+                self.assertLessEqual(len(out), limit)
+                if limit >= 1:
+                    self.assertIn(
+                        "…", out, f"limit={limit} produced no truncation marker at all"
+                    )
+
+    def test_a_negative_limit_behaves_exactly_like_zero(self):
+        for limit in (-1, -100):
+            with self.subTest(limit=limit):
+                acc = review.Accounting({"tree": limit})
+                out = acc.add("tree", "x" * 200)
+                self.assertEqual(out, "")
+                self.assertEqual(acc.used["tree"], 0)
+
+    def test_text_within_budget_is_never_marked_as_truncated(self):
+        acc = review.Accounting({"tree": 100})
+        out = acc.add("tree", "well within budget")
+        self.assertEqual(out, "well within budget")
+        self.assertNotIn("…", out)
+        self.assertEqual(acc.truncated, set())
 
 
 class TestExtractCheckout(unittest.TestCase):
