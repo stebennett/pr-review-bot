@@ -246,9 +246,12 @@ class TestBuildContext(unittest.TestCase):
             ) as ctx:
                 pass
         self.assertIn("src/foo.py", ctx.pack)
-        # Small enough to fit whole, so it is included verbatim (no per-line
-        # numbering) — the real file's second line, byte for byte.
-        self.assertIn("alpha\nbeta2\ngamma\n", ctx.pack)
+        # Whole-file inclusion is rendered through windowed() too, so every
+        # line — including ones a whole-file fit never used to number — comes
+        # out with its real line number and no elision marker (it is the
+        # entire file).
+        self.assertIn("1: alpha\n2: beta2\n3: gamma", ctx.pack)
+        self.assertNotIn("elided", ctx.pack)
         self.assertEqual(ctx.notes, [])
 
 
@@ -358,7 +361,9 @@ class TestPackChangedFiles(unittest.TestCase):
         ranges = {p: [(1, 1)] for p in files}
         out = review.pack_changed_files(
             self.root, None, "o/r", "sha", ranges, self.cfg, self.acc())
-        self.assertIn("5 further changed file(s) not shown", out)
+        # Distinct from files excluded by ignore_paths (Finding 3): this is the
+        # file-count cap, so the label says so.
+        self.assertIn("### 5 further changed file(s) not shown (file cap)", out)
         # All 30 paths tie on hunk count (one range each), so the cap breaks
         # the tie alphabetically on path — assert exactly which 5 lost that
         # tiebreak, not just that some count of them did.
@@ -374,9 +379,83 @@ class TestPackChangedFiles(unittest.TestCase):
         ranges = {"quiet.py": [(1, 1)], "busy.py": [(1, 1), (5, 6), (9, 10)]}
         cfg = dict(self.cfg, max_context_files=1)
         out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, cfg, self.acc())
-        self.assertIn("b\n", out)                                   # busy.py's contents
-        self.assertNotIn("q\n", out)                                # quiet.py's contents
-        self.assertIn("1 further changed file(s) not shown", out)
+        self.assertIn("1: b", out)                                  # busy.py's contents, numbered
+        self.assertNotIn("quiet.py\n```", out)                      # quiet.py's body never rendered
+        self.assertIn("### 1 further changed file(s) not shown (file cap)", out)
+
+    def test_the_section_never_overruns_its_budget_regardless_of_file_count(self):
+        # Regression guard for the divide-and-floor defect: per_file used to
+        # floor at 2000 chars regardless of how many files shared the budget,
+        # so 20+ files (well inside the 25-file cap) blew the section's total
+        # past its limit and Accounting hard-truncated mid-file. The greedy,
+        # remaining-budget-aware assembly must never let that happen again,
+        # at any file count on either side of the old failure threshold.
+        body = "\n".join(f"line{i}" for i in range(1, 301)) + "\n"  # ~2100 chars whole
+        for n in (1, 5, 19, 20, 25, 30):
+            with self.subTest(n=n):
+                tmp = tempfile.TemporaryDirectory()
+                try:
+                    root = pathlib.Path(tmp.name)
+                    files = {f"src/f{i}.py": body for i in range(n)}
+                    make_tree(root, files)
+                    ranges = {p: [(150, 151)] for p in files}
+                    acc = self.acc()
+                    out = review.pack_changed_files(
+                        root, None, "o/r", "sha", ranges, self.cfg, acc)
+                    self.assertLessEqual(len(out), acc.limits["changed_files"])
+                    self.assertNotIn("changed_files", acc.truncated)
+                finally:
+                    tmp.cleanup()
+
+    def test_a_file_larger_than_its_cap_is_windowed_rather_than_dropped_whole(self):
+        lines = "\n".join(f"line{i}" for i in range(1, 501))  # 500 lines
+        make_tree(self.root, {"big.py": lines + "\n"})
+        acc = self.acc(limit=3000)  # deliberately tight changed_files budget
+        out = review.pack_changed_files(
+            self.root, None, "o/r", "sha", {"big.py": [(250, 251)]}, self.cfg, acc)
+        self.assertIn("elided", out)
+        self.assertIn("250: line250", out)
+        self.assertIn("251: line251", out)
+        self.assertNotIn("line1\n", out)  # far outside the window, must be elided
+
+    def test_ignored_and_cap_dropped_files_get_distinct_trailer_labels(self):
+        files = {f"src/f{i}.py": f"body{i}\n" for i in range(3)}
+        files["Cargo.lock"] = "noise\n"
+        make_tree(self.root, files)
+        ranges = {p: [(1, 1)] for p in files}
+        cfg = dict(self.cfg, max_context_files=2)
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, cfg, self.acc())
+        # "Cargo.lock" sorts before the src/f*.py files, so it is the sole
+        # ignore_paths exclusion; the file cap then drops the lowest-priority
+        # remaining file. Both must be named, under their own distinct label.
+        self.assertIn("### 1 file(s) excluded by ignore_paths\n- Cargo.lock", out)
+        self.assertIn("### 1 further changed file(s) not shown (file cap)\n- src/f2.py", out)
+
+    def test_max_context_files_zero_or_negative_yields_no_file_bodies(self):
+        make_tree(self.root, {"src/foo.py": "alpha\nbeta\ngamma\n"})
+        for limit in (0, -1):
+            with self.subTest(limit=limit):
+                cfg = dict(self.cfg, max_context_files=limit)
+                out = review.pack_changed_files(
+                    self.root, None, "o/r", "sha", {"src/foo.py": [(1, 3)]}, cfg, self.acc())
+                self.assertNotIn("beta", out)
+                self.assertIn("### 1 further changed file(s) not shown (file cap)\n- src/foo.py", out)
+
+    def test_whole_file_and_windowed_output_are_both_line_numbered(self):
+        make_tree(self.root, {"small.py": "alpha\nbeta\ngamma\n"})
+        out_whole = review.pack_changed_files(
+            self.root, None, "o/r", "sha", {"small.py": [(1, 3)]}, self.cfg, self.acc())
+        self.assertIn("1: alpha", out_whole)
+        self.assertIn("2: beta", out_whole)
+        self.assertIn("3: gamma", out_whole)
+        self.assertNotIn("elided", out_whole)  # the window IS the whole file
+
+        lines = "\n".join(f"line{i}" for i in range(1, 501))
+        make_tree(self.root, {"big.py": lines + "\n"})
+        out_windowed = review.pack_changed_files(
+            self.root, None, "o/r", "sha", {"big.py": [(250, 251)]}, self.cfg, self.acc(limit=3000))
+        self.assertIn("250: line250", out_windowed)
+        self.assertIn("251: line251", out_windowed)
 
 
 if __name__ == "__main__":

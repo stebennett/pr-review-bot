@@ -846,46 +846,117 @@ def read_source(root: Path | None, gh, repo: str, sha: str, rel: str) -> str | N
     return text
 
 
+def _render_changed_file(rel: str, text: str, file_ranges: list[tuple[int, int]], cap: int) -> str:
+    """One file's rendered section, shrunk in stages to fit `cap` characters.
+
+    Always rendered through `windowed()` — even a file that fits whole is
+    `windowed(text, [(1, <line count>)])` — so every line carries a real line
+    number regardless of which stage it was rendered at. A lens should not
+    have to guess whether it is looking at a whole file or a window into one.
+    `cap` is compared against the fully wrapped `### path` + fence output,
+    never against bare content, because the wrapper is real overhead a lens
+    pays for too.
+    """
+    lines = text.splitlines()
+    for candidate_ranges in (
+        [(1, len(lines))],
+        merge_ranges(file_ranges, WINDOW_PAD),
+        file_ranges,
+    ):
+        body = f"### {rel}\n```\n{windowed(text, candidate_ranges)}\n```\n"
+        if len(body) <= cap:
+            return body
+    return body  # even the tightest window does not fit; caller decides whether to keep it
+
+
 def pack_changed_files(
     root: Path | None, gh, repo: str, sha: str,
     ranges: dict[str, list[tuple[int, int]]], cfg: dict, acc: "Accounting",
 ) -> str:
-    """Every changed file at head, whole where it fits and windowed where it does not."""
-    limit = cfg.get("max_context_files", 25)
+    """Every changed file at head, whole where it fits and windowed where it does not.
+
+    Assembly is greedy and self-limiting: each file's cap is recomputed from
+    whatever budget the files ahead of it left behind, and a file that still
+    would not fit — even after every windowing stage — stops the run rather
+    than being handed to Accounting to slice mid-line. That is the whole
+    point: `acc.add` truncating this section at a raw offset would cut a file
+    body in half, which is worse than dropping the file cleanly and naming it.
+    """
+    if not ranges:
+        return ""
+
+    limit = max(0, cfg.get("max_context_files", 25))
     ignore = cfg.get("ignore_paths") or []
     ordered = sorted(ranges, key=lambda p: (-len(ranges[p]), p))
-    chosen = [p for p in ordered if not path_matches(p, ignore)][:limit]
-    dropped = [p for p in ordered if p not in chosen]
+    ignored = [p for p in ordered if path_matches(p, ignore)]
+    eligible = [p for p in ordered if p not in ignored]
+    chosen = eligible[:limit]
+    cap_dropped = eligible[limit:]
 
-    share = acc.limits["changed_files"]
-    per_file = max(2000, share // max(1, len(chosen)))
-    parts: list[str] = []
-
-    for rel in chosen:
-        text = read_source(root, gh, repo, sha, rel)
-        if text is None:
-            parts.append(f"### {rel}\n(skipped: unreadable, binary, or over {MAX_SOURCE_BYTES} bytes)\n")
-            continue
-        body = text if len(text) <= per_file else windowed(text, merge_ranges(ranges[rel], WINDOW_PAD))
-        if len(body) > per_file:
-            body = windowed(text, ranges[rel])
-        parts.append(f"### {rel}\n```\n{body}\n```\n")
-
-    if dropped:
-        parts.append(
-            f"### {len(dropped)} further changed file(s) not shown\n"
-            + "\n".join(f"- {p}" for p in dropped) + "\n"
-        )
-
-    if not parts:
-        return ""
     header = (
         "## Changed files at head\n\n"
         "Context only. These are the touched files as they stand at the PR head, so you can "
         "see what each hunk sits inside. A finding still anchors to a diff line, never to a "
         "line you first saw here.\n\n"
     )
-    return acc.add("changed_files", header + "\n".join(parts))
+    budget = acc.limits["changed_files"]
+    remaining = max(0, budget - len(header))
+
+    shown_files: list[str] = []
+    shown_parts: list[str] = []
+    budget_dropped: list[str] = []
+    pending = list(chosen)
+    while pending:
+        rel = pending[0]
+        cap = max(0, remaining // len(pending))
+        text = read_source(root, gh, repo, sha, rel)
+        if text is None:
+            body = f"### {rel}\n(skipped: unreadable, binary, or over {MAX_SOURCE_BYTES} bytes)\n"
+        else:
+            body = _render_changed_file(rel, text, ranges[rel], cap)
+        if len(body) <= remaining:
+            shown_files.append(rel)
+            shown_parts.append(body)
+            remaining -= len(body)
+            pending.pop(0)
+        else:
+            # This file — and everything behind it in priority order — does
+            # not fit what is left. Stop here rather than trying smaller
+            # files out of order, which would make "what got shown" depend on
+            # file size instead of the hunk-count priority already promised.
+            budget_dropped = pending
+            break
+
+    # The trailer itself costs characters. If it pushes the total over budget,
+    # give back the lowest-priority shown file (which is worth far more than
+    # one more line in a drop-list) and recompute, rather than ever handing
+    # Accounting an over-budget string to slice.
+    while True:
+        groups: list[str] = []
+        if ignored:
+            groups.append(
+                f"### {len(ignored)} file(s) excluded by ignore_paths\n"
+                + "\n".join(f"- {p}" for p in ignored) + "\n"
+            )
+        if cap_dropped:
+            groups.append(
+                f"### {len(cap_dropped)} further changed file(s) not shown (file cap)\n"
+                + "\n".join(f"- {p}" for p in cap_dropped) + "\n"
+            )
+        if budget_dropped:
+            groups.append(
+                f"### {len(budget_dropped)} further changed file(s) not shown (budget)\n"
+                + "\n".join(f"- {p}" for p in budget_dropped) + "\n"
+            )
+        assembled = header + "\n".join(shown_parts + groups)
+        if len(assembled) <= budget or not shown_parts:
+            break
+        budget_dropped = [shown_files.pop()] + budget_dropped
+        shown_parts.pop()
+
+    if not shown_parts and not ignored and not cap_dropped and not budget_dropped:
+        return ""
+    return acc.add("changed_files", assembled)
 
 
 HUNK_RE = re.compile(r"^@@ -(?P<old>\d+)(?:,(?P<oldc>\d+))? \+(?P<new>\d+)(?:,(?P<newc>\d+))? @@")
