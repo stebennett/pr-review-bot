@@ -1,6 +1,7 @@
 """Context pack assembly. No network: checkouts are built locally with tarfile."""
 
 import pathlib
+import re
 import sys
 import tarfile
 import tempfile
@@ -826,6 +827,230 @@ class TestPackChangedFiles(unittest.TestCase):
                 out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, cfg, acc)
                 self.assertLessEqual(len(out), acc.limits["changed_files"])
                 self.assertNotIn("changed_files", acc.truncated)
+
+
+SYMBOL_DIFF = """\
+diff --git a/src/api.py b/src/api.py
+--- a/src/api.py
++++ b/src/api.py
+@@ -1,4 +1,8 @@
+-def fetch_user(uid):
++def fetch_user(uid, *, strict=False):
++class UserCache:
++    pass
++def go(x):
++export const parseToken = (raw) => raw
+ unchanged
+"""
+
+
+class TestChangedSymbols(unittest.TestCase):
+    def test_a_changed_function_is_extracted(self):
+        self.assertIn("fetch_user", review.changed_symbols(SYMBOL_DIFF))
+
+    def test_a_new_class_is_extracted(self):
+        self.assertIn("UserCache", review.changed_symbols(SYMBOL_DIFF))
+
+    def test_an_exported_const_is_extracted(self):
+        self.assertIn("parseToken", review.changed_symbols(SYMBOL_DIFF))
+
+    def test_short_names_are_dropped(self):
+        self.assertNotIn("go", review.changed_symbols(SYMBOL_DIFF))
+
+    def test_stoplisted_names_are_dropped(self):
+        diff = "+++ b/a.py\n@@ -1,1 +1,1 @@\n+def value(self):\n"
+        self.assertNotIn("value", review.changed_symbols(diff))
+
+    def test_unchanged_lines_contribute_nothing(self):
+        self.assertNotIn("unchanged", review.changed_symbols(SYMBOL_DIFF))
+
+    def test_results_are_deduplicated_and_ordered(self):
+        diff = "+++ b/a.py\n@@ -1,1 +1,2 @@\n+def alpha_one():\n+def alpha_one():\n"
+        self.assertEqual(review.changed_symbols(diff), ["alpha_one"])
+
+    def test_the_full_symbol_list_is_exactly_the_definition_shaped_names_in_order(self):
+        # Weak-assertion guard: every prior test in this class uses assertIn/
+        # assertNotIn on one name at a time, which would miss a spurious EXTRA
+        # symbol slipping into the result. Pin down the whole list.
+        self.assertEqual(
+            review.changed_symbols(SYMBOL_DIFF),
+            ["fetch_user", "UserCache", "parseToken"],
+        )
+
+    def test_more_than_max_symbols_changed_is_capped_at_max_symbols(self):
+        # A tiny fixture can never exercise the 20-symbol cap; this changes 25
+        # distinct, non-stoplisted, adequately-long names so the cap actually
+        # has to bite, and pins the exact surviving prefix rather than just
+        # asserting a count.
+        names = [f"sym_{i:03d}" for i in range(25)]
+        diff = "+++ b/a.py\n@@ -1,1 +1,25 @@\n" + "".join(f"+def {n}():\n" for n in names)
+        out = review.changed_symbols(diff)
+        self.assertEqual(len(out), review.MAX_SYMBOLS)
+        self.assertEqual(out, names[: review.MAX_SYMBOLS])
+
+
+class TestGrepRepo(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.cfg = dict(review.DEFAULTS)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_hit_carries_path_line_and_text(self):
+        make_tree(self.root, {"caller.py": "import x\nfetch_user(7)\n"})
+        hits = review.grep_repo(self.root, ["fetch_user"], self.cfg, exclude=set(), max_hits=40)
+        self.assertEqual(hits["fetch_user"][0][0], "caller.py")
+        self.assertEqual(hits["fetch_user"][0][1], 2)
+        self.assertIn("fetch_user(7)", hits["fetch_user"][0][2])
+
+    def test_the_changed_files_themselves_are_excluded(self):
+        make_tree(self.root, {"src/api.py": "fetch_user\n"})
+        hits = review.grep_repo(
+            self.root, ["fetch_user"], self.cfg, exclude={"src/api.py"}, max_hits=40)
+        self.assertEqual(hits.get("fetch_user", []), [])
+
+    def test_a_symbol_over_the_hit_ceiling_is_dropped_entirely(self):
+        # 50 hits is above SYMBOL_HIT_CEILING (40), so the symbol is dropped
+        # rather than sampled down to max_hits.
+        make_tree(self.root, {f"f{i}.py": "common_name\n" for i in range(50)})
+        hits = review.grep_repo(self.root, ["common_name"], self.cfg, exclude=set(), max_hits=3)
+        self.assertNotIn("common_name", hits)
+
+    def test_a_symbol_under_the_ceiling_is_capped_at_max_hits(self):
+        make_tree(self.root, {f"f{i}.py": "rare_name\n" for i in range(5)})
+        hits = review.grep_repo(self.root, ["rare_name"], self.cfg, exclude=set(), max_hits=3)
+        self.assertEqual(len(hits["rare_name"]), 3)
+
+    def test_ignored_paths_are_not_searched(self):
+        make_tree(self.root, {"Cargo.lock": "fetch_user\n"})
+        hits = review.grep_repo(self.root, ["fetch_user"], self.cfg, exclude=set(), max_hits=40)
+        self.assertEqual(hits.get("fetch_user", []), [])
+
+    def test_binary_files_are_not_searched(self):
+        make_tree(self.root, {"blob.bin": "fetch_user\x00\x01"})
+        hits = review.grep_repo(self.root, ["fetch_user"], self.cfg, exclude=set(), max_hits=40)
+        self.assertEqual(hits.get("fetch_user", []), [])
+
+    def test_a_dot_git_directory_is_skipped(self):
+        make_tree(self.root, {".git/objects/thing": "fetch_user\n"})
+        hits = review.grep_repo(self.root, ["fetch_user"], self.cfg, exclude=set(), max_hits=40)
+        self.assertEqual(hits.get("fetch_user", []), [])
+
+    def test_a_needle_right_at_the_ceiling_is_kept_in_full(self):
+        # Boundary check for "<= SYMBOL_HIT_CEILING": exactly 40 hits (the
+        # ceiling itself) must survive, capped at max_hits, not be dropped
+        # the way 41 would be. Distinguishes <= from < in the implementation.
+        make_tree(self.root, {f"f{i}.py": "boundary_name\n" for i in range(40)})
+        hits = review.grep_repo(
+            self.root, ["boundary_name"], self.cfg, exclude=set(), max_hits=40)
+        self.assertEqual(len(hits["boundary_name"]), 40)
+
+    def test_multiple_needles_are_tracked_independently(self):
+        # A set-equality guard: with several needles in play, each symbol's
+        # hit dict must contain exactly its own hits, no cross-contamination
+        # and no spurious extras from another needle's matches.
+        make_tree(self.root, {
+            "a.py": "alpha_thing()\n",
+            "b.py": "beta_thing()\nalpha_thing()\n",
+            "c.py": "gamma_thing()\n",
+        })
+        hits = review.grep_repo(
+            self.root, ["alpha_thing", "beta_thing", "gamma_thing"], self.cfg,
+            exclude=set(), max_hits=40)
+        self.assertEqual(sorted(hits), ["alpha_thing", "beta_thing", "gamma_thing"])
+        self.assertEqual(
+            sorted((rel, ln) for rel, ln, _ in hits["alpha_thing"]),
+            [("a.py", 1), ("b.py", 2)],
+        )
+        self.assertEqual(len(hits["beta_thing"]), 1)
+        self.assertEqual(len(hits["gamma_thing"]), 1)
+
+
+class TestPackCallSites(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.cfg = dict(review.DEFAULTS)
+        self.addCleanup(self.tmp.cleanup)
+
+    def acc(self, call_sites=15000):
+        return review.Accounting({"changed_files": 1, "call_sites": call_sites, "conventions": 1,
+                                  "requirements": 1, "tree": 1})
+
+    def test_a_caller_outside_the_diff_is_reported(self):
+        make_tree(self.root, {
+            "src/api.py": "def fetch_user(uid):\n    pass\n",
+            "web/view.py": "from src.api import fetch_user\nfetch_user(1)\n",
+        })
+        out = review.pack_call_sites(
+            self.root, SYMBOL_DIFF, {"src/api.py": [(1, 8)]}, self.cfg, self.acc())
+        self.assertIn("web/view.py", out)
+
+    def test_importers_of_a_changed_module_are_reported(self):
+        # Note the module stem must clear MIN_SYMBOL_LEN: "service" does, "api"
+        # would not, so a three-letter module contributes no importer needle.
+        make_tree(self.root, {
+            "src/service.py": "x = 1\n",
+            "web/view.py": "from src.service import thing\n",
+        })
+        out = review.pack_call_sites(
+            self.root, "--- a/src/service.py\n+++ b/src/service.py\n@@ -1,1 +1,1 @@\n+x = 2\n",
+            {"src/service.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertIn("web/view.py", out)
+
+    def test_no_checkout_yields_an_empty_section(self):
+        self.assertEqual(
+            review.pack_call_sites(None, SYMBOL_DIFF, {}, self.cfg, self.acc()), "")
+
+    def test_no_hits_yields_an_empty_section(self):
+        make_tree(self.root, {"src/api.py": "def fetch_user(uid):\n    pass\n"})
+        out = review.pack_call_sites(
+            self.root, SYMBOL_DIFF, {"src/api.py": [(1, 8)]}, self.cfg, self.acc())
+        self.assertNotIn("### ", out)
+
+    def test_more_symbols_than_the_cap_lose_the_module_importer_needle(self):
+        # Exercises the 20-symbol cap concretely, at the pack_call_sites level:
+        # 20 distinct changed symbols already fill `needles` to MAX_SYMBOLS, so
+        # slicing to [:MAX_SYMBOLS] squeezes out the module-stem needle even
+        # though it would otherwise find a real importer. Assert the exact set
+        # of `### \`name\`` headers produced, not merely that one is present.
+        names = [f"sym_{i:03d}" for i in range(review.MAX_SYMBOLS)]
+        diff = "+++ b/src/service.py\n@@ -1,1 +1,20 @@\n" + "".join(
+            f"+def {n}():\n" for n in names)
+        files = {"src/service.py": "\n".join(f"def {n}(): pass" for n in names) + "\n"}
+        # Every changed symbol has exactly one caller outside the diff...
+        for i, n in enumerate(names):
+            files[f"callers/c{i}.py"] = f"{n}()\n"
+        # ...and the module "service" also has an importer, which must NOT
+        # show up because the needle list is already full of symbols.
+        files["web/view.py"] = "from src.service import thing\n"
+        make_tree(self.root, files)
+        out = review.pack_call_sites(
+            self.root, diff, {"src/service.py": [(1, 20)]}, self.cfg, self.acc())
+
+        found = set(re.findall(r"### `([^`]+)`", out))
+        self.assertEqual(found, set(names))
+        self.assertNotIn("web/view.py", out)
+
+    def test_the_section_is_truncated_in_band_when_it_exceeds_its_budget(self):
+        # A large, shaped fixture: enough distinct symbols, each with enough
+        # hits, that the rendered section is far bigger than a deliberately
+        # tiny call_sites budget — so the branch that actually exercises
+        # Accounting's truncation runs, rather than a fixture too small to
+        # ever reach it.
+        names = [f"big_symbol_{i:03d}" for i in range(review.MAX_SYMBOLS)]
+        diff = "+++ b/src/big.py\n@@ -1,1 +1,20 @@\n" + "".join(
+            f"+def {n}():\n" for n in names)
+        files = {}
+        for i, n in enumerate(names):
+            files[f"callers/c{i}.py"] = "\n".join(f"{n}(argument_number_{j})" for j in range(5)) + "\n"
+        make_tree(self.root, files)
+        acc = self.acc(call_sites=200)
+        out = review.pack_call_sites(
+            self.root, diff, {"src/big.py": [(1, 20)]}, self.cfg, acc)
+        self.assertLessEqual(len(out), 200)
+        self.assertIn("call_sites", acc.truncated)
+        self.assertIn("…", out)
 
 
 if __name__ == "__main__":
