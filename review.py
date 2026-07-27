@@ -853,6 +853,24 @@ def diff_anchors(diff: str) -> set[tuple[str, int, str]]:
     return anchors
 
 
+def anchor_violations(envelopes: list[dict], diff: str) -> list[tuple[str, dict]]:
+    """Findings anchored outside the diff, as (lens, finding) pairs.
+
+    Doctrine etiquette rule 4 forbids these, and giving a lens surrounding code
+    makes them tempting. They are REPORTED, never dropped: a real bug cited at a
+    slightly wrong line is worth more than a clean log, and post_review already
+    folds inline comments into the body when GitHub rejects them with a 422.
+    The count is the signal for whether the pack is eroding lens discipline.
+    """
+    anchors = diff_anchors(diff)
+    return [
+        (env["lens"], f)
+        for env in envelopes
+        for f in env.get("findings") or []
+        if (f["path"], f["line"], f["side"]) not in anchors
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The pass
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1025,6 +1043,15 @@ def run_panel(pr: dict, repo: str, diff: str, requirements: str, opts: argparse.
 
     total = sum(len(e["findings"]) for e in envelopes)
     log(f"  panel returned {total} finding(s); adjudicating")
+
+    violations = anchor_violations(envelopes, diff)
+    if violations:
+        log(f"  WARNING: {len(violations)} finding(s) anchored outside the diff (kept, not dropped):")
+        for lens, f in violations:
+            log(f"    lens:{lens} {f['path']}:{f['line']} {f['side']} — {f['claim'][:80]}")
+    else:
+        log("  anchors: all findings anchor inside the diff")
+
     verdict = adjudicate(pr, repo, envelopes, requirements, opts.model_verdict)
 
     if opts.save:

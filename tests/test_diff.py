@@ -219,5 +219,62 @@ class TestDiffAnchors(unittest.TestCase):
         )
 
 
+def _finding(path, line, side="RIGHT"):
+    return {
+        "path": path, "line": line, "side": side, "severity": "blocking",
+        "claim": "c", "consequence": "q", "failure_scenario": None,
+        "fix": "f", "addressed_prior": False,
+    }
+
+
+class TestAnchorViolations(unittest.TestCase):
+    def envelope(self, lens, findings):
+        return {"lens": lens, "status": "complete", "findings": findings, "notes": "n"}
+
+    def test_a_finding_inside_the_diff_is_not_a_violation(self):
+        env = [self.envelope("craft", [_finding("src/bar.py", 2)])]
+        self.assertEqual(review.anchor_violations(env, TWO_FILES), [])
+
+    def test_a_finding_on_an_untouched_line_is_a_violation(self):
+        finding = _finding("src/bar.py", 900)
+        env = [self.envelope("craft", [finding])]
+        self.assertEqual(review.anchor_violations(env, TWO_FILES), [("craft", finding)])
+
+    def test_a_finding_on_an_untouched_file_is_a_violation(self):
+        finding = _finding("src/elsewhere.py", 1)
+        env = [self.envelope("craft", [finding])]
+        self.assertEqual(review.anchor_violations(env, TWO_FILES), [("craft", finding)])
+
+    def test_the_side_is_part_of_the_anchor_key(self):
+        # bar.py has three RIGHT lines but only two LEFT ones, so RIGHT 3 is a
+        # valid anchor and LEFT 3 is not.
+        anchors = review.diff_anchors(TWO_FILES)
+        self.assertIn(("src/bar.py", 3, "RIGHT"), anchors)
+        finding = _finding("src/bar.py", 3, side="LEFT")
+        env = [self.envelope("craft", [finding])]
+        self.assertEqual(review.anchor_violations(env, TWO_FILES), [("craft", finding)])
+
+    def test_the_offending_lens_is_reported_with_the_finding(self):
+        finding = _finding("nope.py", 1)
+        env = [self.envelope("correctness", [finding])]
+        self.assertEqual(review.anchor_violations(env, TWO_FILES), [("correctness", finding)])
+
+    def test_a_needs_input_envelope_with_no_findings_is_fine(self):
+        env = [{"lens": "craft", "status": "needs-input", "findings": [], "notes": "failed"}]
+        self.assertEqual(review.anchor_violations(env, TWO_FILES), [])
+
+    def test_violations_are_reported_across_multiple_lenses_and_findings(self):
+        # Full-equality check across a mixed panel: one lens clean, one lens with
+        # one good and one bad finding, in the order envelopes/findings appear —
+        # guards against both missing and spurious entries.
+        good = _finding("src/bar.py", 2)
+        bad = _finding("src/bar.py", 900)
+        env = [
+            self.envelope("requirements", [good]),
+            self.envelope("craft", [good, bad]),
+        ]
+        self.assertEqual(review.anchor_violations(env, TWO_FILES), [("craft", bad)])
+
+
 if __name__ == "__main__":
     unittest.main()
