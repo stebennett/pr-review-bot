@@ -921,10 +921,18 @@ grep -E "lens:(requirements|correctness|craft):.*cached=" /tmp/reordered.log
 
 Expected: `cached=0` on `lens:requirements` (it writes), and a large non-zero `cached=` on the other two.
 
+**Two criteria in this step were written before the routes were measured, and are wrong. Use these instead:**
+
+- **`cache_discount` is never returned on this route** — it logs as `-` on every call, cached or not. Do not use its absence as evidence of anything. `cached_tokens` is the only reliable signal.
+- **`cached=0` is not the "caching off" signal.** Some providers cache automatically regardless of `cache_control`: a `--no-cache` run still showed `cached=64` on a lens and `cached=4096` on the DeepSeek verdict call. Judge by **magnitude**, not by zero versus non-zero.
+
 - [ ] **Step 4: Decide on caching, and record the numbers**
 
-- **Non-zero reads on lenses 2 and 3** → caching works. Keep it. Record the `cached=` and `discount=` values in the task notes.
-- **Zero on all three** → this route ignores `cache_control`. Set `"cache": False` in `DEFAULTS`, commit that with the measured evidence in the message, and leave the machinery in place for a future model change. Do not ship staggered dispatch without cache reads — it buys latency for nothing.
+Compare cached tokens as a fraction of that call's input tokens on the two trailing lenses:
+
+- **≥50% of input cached on lenses 2 and 3** → our prefix caching is working. Keep it. Record the absolute `cached=`/`in=` pairs.
+- **Only a few hundred tokens cached, comparable to a `--no-cache` run** → the reads are provider-side automatic caching, not ours. Set `"cache": False` in `DEFAULTS`, commit that with the measured evidence, and leave the machinery in place for a future model change. Do not ship staggered dispatch without real cache reads — it buys latency for nothing.
+- **Routing varies per call** (four different providers were seen across five calls in the Task 1 baseline), so a single anomalous reading is inconclusive. Re-run once before concluding caching does not work.
 - **Routing errors or a provider refusal** → check the `provider: {"require_parameters": True}` interaction flagged in the spec. Try one run with that key removed to see whether it is the cause, then restore it: it is load-bearing for `response_format` and must not be dropped as a fix.
 
 - [ ] **Step 5: Commit any decision that changed code**
