@@ -1258,12 +1258,16 @@ class TestPackConventions(unittest.TestCase):
         self.assertIn("App CONTRIBUTING conventions.", out)
         self.assertIn("Web AGENTS conventions.", out)
 
-    def test_two_touched_branches_at_different_depths_are_ordered_by_depth_then_path(self):
-        # Two independently touched branches, each with its own convention
-        # file at a different depth, plus the always-considered root. The
-        # chosen rule (descending depth, ties broken by path) must produce
-        # exactly this order regardless of which branch happens to sort
-        # first alphabetically or get built first as a set/dict.
+    def test_two_touched_branches_are_ordered_by_distance_not_absolute_depth(self):
+        # Round-2 fix: absolute directory depth is the wrong proxy across
+        # branches. "api/AGENTS.md" sits *in* its changed directory
+        # (api/handler.py -> distance 0), while "web/app/CONTRIBUTING.md" is
+        # one level above its changed directory (web/app/deep/mod.py's own
+        # dir is web/app/deep -> distance 1) despite living at a deeper
+        # absolute path. Distance must rank the genuinely adjacent file
+        # first even though it is shallower in absolute terms — this test
+        # replaces a round-1 test that asserted the old (wrong) absolute-depth
+        # order, which put web/app/CONTRIBUTING.md first.
         make_tree(self.root, {
             "CLAUDE.md": "Root rules.\n",
             "api/AGENTS.md": "Api rules.\n",
@@ -1273,8 +1277,73 @@ class TestPackConventions(unittest.TestCase):
         out = review.pack_conventions(self.root, ranges, self.acc())
         self.assertEqual(
             self._headers(out),
-            ["web/app/CONTRIBUTING.md", "api/AGENTS.md", "CLAUDE.md"],
+            ["api/AGENTS.md", "web/app/CONTRIBUTING.md", "CLAUDE.md"],
         )
+
+    def test_a_shallower_but_adjacent_file_outranks_a_deeper_but_distant_one(self):
+        # The exact reproduction from the round-2 finding: a/CLAUDE.md sits
+        # directly in the changed directory "a" (distance 0), while
+        # x/y/AGENTS.md is two levels above the changed directory "x/y/z"
+        # (distance 2) despite x/y being absolutely deeper than "a". The
+        # adjacent file must survive a tight budget; the merely-deeper one
+        # must not. Swept across three budgets so this does not hinge on one
+        # lucky threshold.
+        make_tree(self.root, {
+            "a/CLAUDE.md": "adjacentadjacent" * 500 + "\n",
+            "x/y/AGENTS.md": "distantdistant" * 500 + "\n",
+        })
+        ranges = {"a/file.py": [(1, 1)], "x/y/z/w.py": [(1, 1)]}
+        out_full = review.pack_conventions(self.root, ranges, self.acc(conventions=1_000_000))
+        self.assertEqual(self._headers(out_full), ["a/CLAUDE.md", "x/y/AGENTS.md"])
+        for budget in (5200, 5000, 4800):
+            with self.subTest(budget=budget):
+                out = review.pack_conventions(self.root, ranges, self.acc(conventions=budget))
+                self.assertIn("truncated", out)
+                self.assertIn("adjacentadjacent", out)
+                self.assertNotIn("distantdistant", out)
+
+    def test_equal_distance_ties_are_deterministic_across_repeated_calls(self):
+        # Two branches whose convention files each sit directly in their own
+        # changed directory (distance 0 for both) force a real tie, broken
+        # only by the (-depth, path) tail of the sort key. Run several times
+        # in-process, and again across hash seeds in a subprocess (the same
+        # failure mode as the previous determinism bugs on this plan), and
+        # assert byte-identical output every time.
+        make_tree(self.root, {
+            "api/AGENTS.md": "Api rules.\n",
+            "web/CONTRIBUTING.md": "Web rules.\n",
+        })
+        ranges = {"api/handler.py": [(1, 1)], "web/app.py": [(1, 1)]}
+        first = review.pack_conventions(self.root, ranges, self.acc())
+        # Both are distance 0 and equal depth, so the path tie-break decides:
+        # "api" sorts before "web".
+        self.assertEqual(self._headers(first), ["api/AGENTS.md", "web/CONTRIBUTING.md"])
+        for _ in range(5):
+            self.assertEqual(review.pack_conventions(self.root, ranges, self.acc()), first)
+
+        review_dir = str(pathlib.Path(review.__file__).resolve().parent)
+        script = (
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {review_dir!r})\n"
+            "import review\n"
+            f"ranges = {ranges!r}\n"
+            "acc = review.Accounting({'changed_files': 1, 'call_sites': 1,\n"
+            "                         'conventions': 12000, 'requirements': 1, 'tree': 6000})\n"
+            f"out = review.pack_conventions(pathlib.Path({str(self.root)!r}), ranges, acc)\n"
+            "sys.stdout.write(out)\n"
+        )
+        outputs = []
+        for seed in ("0", "1", "42"):
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True, text=True, check=True,
+            )
+            outputs.append(proc.stdout)
+        self.assertTrue(outputs[0], "the fixture produced nothing; it proves nothing")
+        self.assertEqual(outputs[0], first)
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0], outputs[2])
 
     def test_a_shared_ancestor_file_is_not_duplicated_across_changed_files(self):
         make_tree(self.root, {"src/CLAUDE.md": "Src rules.\n"})

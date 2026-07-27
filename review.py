@@ -1391,11 +1391,24 @@ def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]]
 
     Collects every `CONVENTION_FILES` match from each changed file's own
     directory up to the repo root, across every touched branch, then orders
-    the result by descending directory depth — deepest (nearest to a change)
-    first, root last — breaking ties on the prefix string for determinism.
-    `Accounting.add` truncates from the tail, so this ordering is what
-    guarantees a budget squeeze sacrifices the least specific guidance (the
-    root file) rather than the most specific one (a nested `web/AGENTS.md`).
+    the result by *distance*: for each candidate directory, the fewest
+    levels down to the nearest changed directory beneath it (0 for a file
+    that sits directly in a changed directory), ascending. Ties — including
+    the common case of two different branches each holding a file in their
+    own changed directory — are broken by `(-depth, path)`, deeper first,
+    for a stable, deterministic order rather than a meaningful one.
+    `Accounting.add` truncates from the tail, so this is what a budget
+    squeeze sacrifices last: the file nearest to *some* change, not merely
+    the file living at the deepest absolute path. Absolute depth alone was
+    tried first and is wrong across branches — a file two directories above
+    a deeply-nested change can outrank a file sitting right next to a
+    shallower one, which is backwards; distance-to-nearest-change is what
+    the "most specific guidance survives" guarantee actually requires.
+    Root is never truly favoured or disfavoured by this rule on its own
+    merits — it wins only when it is, in fact, the nearest convention file
+    to every touched branch (e.g. a repo with no nested convention files at
+    all), which is the correct outcome in that case.
+
     Sorting on a tuple key rather than relying on insertion order also means
     the result cannot depend on set/dict iteration order, which is otherwise
     seeded per-process and would make the pack non-deterministic across runs.
@@ -1421,8 +1434,16 @@ def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]]
     def depth_of(prefix: str) -> int:
         return 0 if not prefix else prefix.count("/") + 1
 
+    def is_ancestor(prefix: str, d: str) -> bool:
+        return prefix == "" or d == prefix or d.startswith(prefix + "/")
+
+    def distance_of(prefix: str) -> int:
+        # Every prefix here was built as an ancestor of at least one own_dir
+        # (see the loop above), so this is never an empty min().
+        return min(depth_of(d) - depth_of(prefix) for d in own_dirs if is_ancestor(prefix, d))
+
     wanted: list[str] = []
-    for prefix in sorted(prefixes, key=lambda p: (-depth_of(p), p)):
+    for prefix in sorted(prefixes, key=lambda p: (distance_of(p), -depth_of(p), p)):
         for name in CONVENTION_FILES:
             rel = f"{prefix}/{name}" if prefix else name
             if (root / rel).is_file() and rel not in wanted:
