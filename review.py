@@ -78,6 +78,7 @@ DEFAULTS = {
     "max_rounds": 3,
     "max_review_lines": 3000,
     "ignore_paths": ["*.lock", "package-lock.json", "**/generated/**"],
+    "cache": True,
 }
 
 VERBOSE = False
@@ -960,6 +961,9 @@ def review_pr(gh: GitHub, repo: str, pr: dict, cfg: dict, opts: argparse.Namespa
     # is the PR body itself, which is what the lenses check conformity against.
     requirements = pr.get("body") or "(none stated — judge against the PR title alone)"
 
+    global CACHE_ENABLED
+    CACHE_ENABLED = resolve_cache(opts, cfg)
+
     verdict = run_panel(pr, repo, diff, requirements, opts)
     if verdict is None:
         return "skipped (could not review)"
@@ -990,6 +994,8 @@ def review_diff_file(opts: argparse.Namespace) -> int:
         "_prior_body": None,
     }
     log(f"offline review of {opts.diff_file} ({diff_size(diff)} changed lines)")
+    global CACHE_ENABLED
+    CACHE_ENABLED = resolve_cache(opts)
     verdict = run_panel(pr, opts.repo_name or "local/local", diff, pr["body"] or "(none stated)", opts)
     if verdict is None:
         return 1
@@ -1022,6 +1028,8 @@ With no target, falls back to $TARGET_REPOS — that is how it runs in-cluster.
     )
     p.add_argument("targets", nargs="*", help="owner/repo, owner/repo#42, or a PR URL")
     p.add_argument("--post", action="store_true", help="actually post reviews (default: dry run)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="disable prompt caching and revert to a single parallel lens wave")
     p.add_argument("--dry-run", action="store_true", help="force dry run, overriding DRY_RUN=0")
     p.add_argument("-f", "--force", action="store_true",
                    help="bypass already-reviewed, max_rounds and max_review_lines skips")
@@ -1055,6 +1063,17 @@ def resolve_post(opts: argparse.Namespace) -> bool:
     if opts.post:
         return True
     return os.environ.get("DRY_RUN", "").strip().lower() in ("0", "false", "no")
+
+
+def resolve_cache(opts: argparse.Namespace, cfg: dict | None = None) -> bool:
+    """Caching is on unless the CLI or the target repo's config turns it off.
+
+    The CLI wins, so --no-cache is always an effective escape hatch regardless of
+    what a target repo asks for.
+    """
+    if opts.no_cache:
+        return False
+    return bool((cfg or DEFAULTS).get("cache", True))
 
 
 def main(argv: list[str] | None = None) -> int:
