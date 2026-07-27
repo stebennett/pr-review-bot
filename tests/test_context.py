@@ -580,6 +580,87 @@ class TestPackChangedFiles(unittest.TestCase):
         self.assertLessEqual(len(out), acc.limits["changed_files"])
         self.assertNotIn("changed_files", acc.truncated)
 
+    def test_utilisation_stays_high_across_the_whole_file_count_range(self):
+        # Round-4 regression, and the reason the round-1 sweep above was not
+        # enough: it asserted only the ceiling (never overrun), so a build that
+        # spent 15% of the budget passed it green. Utilisation has a floor too,
+        # and the floor has to be checked at every file count, because the way
+        # this collapsed was count-dependent — 97.8% on a 10-file PR, 15.2% on
+        # a 19-file one, because single-shot allocation dropped every file to
+        # its tightest window at once and never redistributed what that freed.
+        #
+        # Each file here is ~50 KB whole, so at EVERY count in the sweep —
+        # including n=1 — the chosen files cannot all be shown whole and real
+        # allocation has to happen. Two well-separated hunks per file, so the
+        # padded window is a genuine middle rung between the tight window and
+        # the whole file, and there is somewhere for the allocator to fail.
+        line = "x" * 40
+        body = "\n".join(f"line{i}{line}" for i in range(1, 901)) + "\n"
+        for n in (1, 5, 10, 15, 19, 20, 25, 30):
+            with self.subTest(n=n):
+                tmp = tempfile.TemporaryDirectory()
+                try:
+                    root = pathlib.Path(tmp.name)
+                    files = {f"src/f{i:02d}.py": body for i in range(n)}
+                    make_tree(root, files)
+                    ranges = {p: [(200, 205), (600, 605)] for p in files}
+                    acc = self.acc()
+                    out = review.pack_changed_files(
+                        root, None, "o/r", "sha", ranges, self.cfg, acc)
+                    limit = acc.limits["changed_files"]
+                    self.assertLessEqual(len(out), limit)
+                    self.assertNotIn("changed_files", acc.truncated)
+                    self.assertGreaterEqual(
+                        acc.used["changed_files"], 0.85 * limit,
+                        f"n={n}: used {acc.used['changed_files']} of {limit} "
+                        f"({100.0 * acc.used['changed_files'] / limit:.1f}%)")
+                finally:
+                    tmp.cleanup()
+
+    def test_a_collectively_fitting_set_is_emitted_whole_with_every_line_present(self):
+        # Stronger than "no elision marker appears": every line of every file
+        # is asserted present under its own real line number, so a build that
+        # dropped a file's tail, or renumbered it, cannot pass by rendering
+        # something elision-free but incomplete.
+        specs = {"a.py": 40, "b.py": 120, "c.py": 15, "d.py": 200}
+        files = {name: "\n".join(f"line{i}" for i in range(1, n + 1)) + "\n"
+                 for name, n in specs.items()}
+        make_tree(self.root, files)
+        ranges = {name: [(2, 3)] for name in specs}
+        acc = self.acc()
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+        for name, n in specs.items():
+            self.assertIn(f"### {name}", out)
+            for i in (1, n // 2, n):
+                self.assertIn(f"{i}: line{i}\n", out)
+        self.assertNotIn("elided", out)
+        self.assertNotIn("not shown", out)
+        self.assertLessEqual(len(out), acc.limits["changed_files"])
+        self.assertNotIn("changed_files", acc.truncated)
+
+    def test_an_unfittable_top_priority_file_is_dropped_while_the_rest_are_shown(self):
+        # Stronger than the round-2 test above, which put the unfittable file
+        # first only by an alphabetical tiebreak. Here it has the MOST hunks,
+        # so it is genuinely the top-priority file, and its diff touches its
+        # entire body, so no window shrinks it below the whole budget. It has
+        # to be dropped and named anyway — priority orders who gets served
+        # first, it does not entitle one file to starve every other.
+        huge = "\n".join(f"line{i}" for i in range(1, 4001)) + "\n"
+        files = {"aaa_unfittable.py": huge}
+        ranges = {"aaa_unfittable.py": [(1, 1000), (1001, 2000), (2001, 3000), (3001, 4000)]}
+        for i in range(4):
+            name = f"small{i}.py"
+            files[name] = f"alpha{i}\nbeta{i}\ngamma{i}\n"
+            ranges[name] = [(1, 3)]
+        make_tree(self.root, files)
+        acc = self.acc(limit=4000)
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+        self.assertIn("### 1 further changed file(s) not shown (budget)\n- aaa_unfittable.py", out)
+        for i in range(4):
+            self.assertIn(f"### small{i}.py\n```\n1: alpha{i}\n2: beta{i}\n3: gamma{i}\n```\n", out)
+        self.assertLessEqual(len(out), acc.limits["changed_files"])
+        self.assertNotIn("changed_files", acc.truncated)
+
     def test_a_tiny_budget_with_a_long_dropped_file_list_does_not_truncate(self):
         # Folded-in Minor: the trailer-shrink loop used to exit unconditionally
         # once shown_parts was empty, even if header + trailer alone still
