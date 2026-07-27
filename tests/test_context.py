@@ -1213,6 +1213,12 @@ class TestPackConventions(unittest.TestCase):
     def _headers(self, out):
         return re.findall(r"(?m)^### (.+)$", out)
 
+    def _fence_line_after(self, out, heading):
+        """The exact line right after `heading` (e.g. "### CLAUDE.md\n") — the
+        opening fence a document was wrapped in."""
+        idx = out.index(heading) + len(heading)
+        return out[idx: out.index("\n", idx)]
+
     def test_a_root_claude_md_is_included(self):
         make_tree(self.root, {"CLAUDE.md": "Always use tabs.\n"})
         out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
@@ -1389,6 +1395,67 @@ class TestPackConventions(unittest.TestCase):
                 self.assertIn("truncated", out)
                 self.assertIn("nearnearnear", out)
                 self.assertNotIn("rootrootroot", out)
+
+    def test_a_document_containing_a_triple_backtick_block_is_not_terminated_early(self):
+        # A CLAUDE.md documenting its own fenced example is routine (the
+        # real golf-tracker one has several). A fixed 3-backtick wrapper
+        # would be closed by the document's own ``` line, spilling the rest
+        # of the document — including its headings — out unfenced.
+        doc = "# Title\n\nExample:\n\n```\ncode here\n```\n\nMore text after the fence.\n"
+        make_tree(self.root, {"CLAUDE.md": doc})
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
+        fence = self._fence_line_after(out, "### CLAUDE.md\n")
+        self.assertEqual(fence, "````")  # longest run in doc is 3, so wrapper is 4
+        self.assertEqual(out.count(fence), 2)
+        start = out.index(fence) + len(fence)
+        end = out.index(fence, start)
+        self.assertIn("More text after the fence.", out[start:end])
+
+    def test_a_document_containing_a_four_backtick_block_gets_a_five_backtick_wrapper(self):
+        # The rule must not be "always use four" — it must outrun whatever
+        # the longest run actually present is, however long that is.
+        doc = "# Title\n\n````\nnested example with ``` inside\n````\n\nTrailer text.\n"
+        make_tree(self.root, {"AGENTS.md": doc})
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
+        fence = self._fence_line_after(out, "### AGENTS.md\n")
+        self.assertEqual(fence, "`````")  # longest run in doc is 4, so wrapper is 5
+        self.assertEqual(out.count(fence), 2)
+        start = out.index(fence) + len(fence)
+        end = out.index(fence, start)
+        self.assertIn("Trailer text.", out[start:end])
+
+    def test_a_documents_own_headings_are_fenced_out_of_prompt_structure(self):
+        # The core defect: a document's own #/## headings must not read as
+        # more prompt structure at the same level as the pack's own
+        # "## Repo conventions" heading (or the file-name "### rel" heading).
+        doc = "# CLAUDE.md\n\n## Project status\n\n## Conventions\n\nUse tabs.\n"
+        make_tree(self.root, {"CLAUDE.md": doc})
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
+        fence = self._fence_line_after(out, "### CLAUDE.md\n")
+        self.assertEqual(fence, "```")  # no backticks in the doc itself
+        self.assertEqual(out.count(fence), 2)
+        start = out.index(fence) + len(fence)
+        end = out.index(fence, start)
+        inside, outside = out[start:end], out[:start] + out[end + len(fence):]
+        self.assertIn("\n## Conventions\n", inside)
+        self.assertIn("# CLAUDE.md\n", inside)
+        self.assertNotIn("\n## Conventions\n", outside)
+        self.assertNotIn("\n# CLAUDE.md\n", outside)
+        # The pack's own structural headings are untouched.
+        self.assertIn("## Repo conventions", outside)
+        self.assertIn("### CLAUDE.md", outside)
+
+    def test_multiple_documents_are_each_delimited_with_their_own_fence(self):
+        # Each selected document gets its own fence sized to its own
+        # content — one file's embedded fence must not force a wider
+        # wrapper on a different file that doesn't need one.
+        make_tree(self.root, {
+            "CLAUDE.md": "Plain rules, no fences here.\n",
+            "web/AGENTS.md": "Has an example:\n\n```\nexample code\n```\n\nAfter.\n",
+        })
+        out = review.pack_conventions(self.root, {"web/app/x.py": [(1, 1)]}, self.acc())
+        self.assertEqual(self._fence_line_after(out, "### web/AGENTS.md\n"), "````")
+        self.assertEqual(self._fence_line_after(out, "### CLAUDE.md\n"), "```")
 
     def test_no_convention_files_and_no_readme_yields_an_empty_section(self):
         make_tree(self.root, {"src/a.py": "x = 1\n"})

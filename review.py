@@ -1386,6 +1386,24 @@ CONVENTION_FILES = ("CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md")
 TREE_KEEP_DEPTH = 2
 
 
+def _fence(text: str) -> str:
+    """A backtick fence strictly longer than any run of backticks in `text`.
+
+    Markdown closes a fenced block at the first line that is itself a run of
+    backticks at least as long as the one that opened it. A fixed 3-backtick
+    wrapper is therefore closed early by any embedded document that contains
+    its own 3-or-more-backtick block — routine in a CLAUDE.md/AGENTS.md that
+    documents fenced examples — after which the rest of the document, and
+    its own `#`/`##` headings, spill out unfenced into the prompt at the
+    same structural level as the pack's own section headings. The fence
+    must outrun whatever the longest run in the content actually is, not
+    merely upgrade from three backticks to four.
+    """
+    runs = re.findall(r"`+", text)
+    longest = max((len(r) for r in runs), default=0)
+    return "`" * max(3, longest + 1)
+
+
 def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]], acc: "Accounting") -> str:
     """The conventions documents governing the changed directories.
 
@@ -1416,6 +1434,12 @@ def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]]
     README is added only when nothing in `CONVENTION_FILES` was found
     anywhere: it is usually description rather than instruction, and is often
     long enough on its own to crowd out the real thing under the budget.
+
+    Each document is wrapped in its own `_fence()`-sized delimiter (see
+    `pack_changed_files`, which does the same for file bodies): a convention
+    document's own `#`/`##` headings must stay visibly inside a quoted block
+    rather than reading as more prompt structure at the same level as this
+    section's own `## Repo conventions` heading.
     """
     if root is None:
         return ""
@@ -1460,7 +1484,8 @@ def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]]
             text = (root / rel).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        parts_out.append(f"### {rel}\n{text}\n")
+        fence = _fence(text)
+        parts_out.append(f"### {rel}\n{fence}\n{text}\n{fence}\n")
 
     header = (
         "## Repo conventions\n\n"
