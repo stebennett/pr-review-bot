@@ -1200,5 +1200,188 @@ class TestPackCallSitesDeterminism(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[2])
 
 
+class TestPackConventions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def acc(self, conventions=12000):
+        return review.Accounting({"changed_files": 1, "call_sites": 1, "conventions": conventions,
+                                  "requirements": 1, "tree": 6000})
+
+    def _headers(self, out):
+        return re.findall(r"(?m)^### (.+)$", out)
+
+    def test_a_root_claude_md_is_included(self):
+        make_tree(self.root, {"CLAUDE.md": "Always use tabs.\n"})
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
+        self.assertEqual(self._headers(out), ["CLAUDE.md"])
+        self.assertIn("Always use tabs.", out)
+
+    def test_a_nearest_ancestor_file_is_included(self):
+        make_tree(self.root, {"web/AGENTS.md": "Web rules.\n"})
+        out = review.pack_conventions(self.root, {"web/app/x.py": [(1, 1)]}, self.acc())
+        self.assertEqual(self._headers(out), ["web/AGENTS.md"])
+        self.assertIn("Web rules.", out)
+
+    def test_readme_is_used_only_when_nothing_else_exists(self):
+        make_tree(self.root, {"README.md": "Readme text.\n"})
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
+        self.assertEqual(self._headers(out), ["README.md"])
+        self.assertIn("Readme text.", out)
+
+    def test_readme_is_omitted_when_a_conventions_file_exists(self):
+        make_tree(self.root, {"README.md": "Readme text.\n", "CONTRIBUTING.md": "Contribute.\n"})
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
+        self.assertEqual(self._headers(out), ["CONTRIBUTING.md"])
+        self.assertNotIn("Readme text.", out)
+
+    def test_multi_level_ancestors_are_collected_nearest_first_per_branch(self):
+        # Real depth: a root file, a mid-level file, and a file right next to
+        # the change, all three distinct so order is unambiguous. Nearest to
+        # the changed file (web/app/deep/mod.py) is web/app/CONTRIBUTING.md,
+        # then web/AGENTS.md, then the root CLAUDE.md (always considered,
+        # since dirs always includes "" alongside every changed directory).
+        make_tree(self.root, {
+            "CLAUDE.md": "Root CLAUDE conventions.\n",
+            "web/AGENTS.md": "Web AGENTS conventions.\n",
+            "web/app/CONTRIBUTING.md": "App CONTRIBUTING conventions.\n",
+        })
+        out = review.pack_conventions(self.root, {"web/app/deep/mod.py": [(1, 1)]}, self.acc())
+        self.assertEqual(
+            self._headers(out),
+            ["CLAUDE.md", "web/app/CONTRIBUTING.md", "web/AGENTS.md"],
+        )
+        self.assertIn("Root CLAUDE conventions.", out)
+        self.assertIn("App CONTRIBUTING conventions.", out)
+        self.assertIn("Web AGENTS conventions.", out)
+
+    def test_a_shared_ancestor_file_is_not_duplicated_across_changed_files(self):
+        make_tree(self.root, {"src/CLAUDE.md": "Src rules.\n"})
+        out = review.pack_conventions(
+            self.root, {"src/a.py": [(1, 1)], "src/sub/b.py": [(1, 1)]}, self.acc()
+        )
+        self.assertEqual(self._headers(out).count("src/CLAUDE.md"), 1)
+
+    def test_truncation_keeps_the_nearest_file_and_drops_the_farther_one(self):
+        # Two real convention files, each large enough that a budget between
+        # "nearest alone" and "both" forces a real choice — a fixture where
+        # every file is a few bytes could pass this even with the priority
+        # backwards.
+        make_tree(self.root, {
+            "web/AGENTS.md": "farfarfar" * 600 + "\n",
+            "web/app/CONTRIBUTING.md": "nearnearnear" * 600 + "\n",
+        })
+        ranges = {"web/app/x.py": [(1, 1)]}
+        full = review.pack_conventions(self.root, ranges, self.acc(conventions=1_000_000))
+        # Nearest (CONTRIBUTING) is emitted first; this is where the farther
+        # file's (AGENTS) content begins in the untruncated text.
+        boundary = full.index("farfarfar")
+        out = review.pack_conventions(self.root, ranges, self.acc(conventions=boundary))
+        self.assertIn("truncated", out)
+        self.assertIn("nearnearnear" * 590, out)
+        self.assertNotIn("farfarfar", out)
+
+    def test_no_convention_files_and_no_readme_yields_an_empty_section(self):
+        make_tree(self.root, {"src/a.py": "x = 1\n"})
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
+        self.assertEqual(out, "")
+
+    def test_no_checkout_yields_an_empty_section(self):
+        self.assertEqual(review.pack_conventions(None, {}, self.acc()), "")
+
+
+class TestPackTree(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.cfg = dict(review.DEFAULTS)
+        self.addCleanup(self.tmp.cleanup)
+
+    def acc(self, tree=6000):
+        return review.Accounting({"changed_files": 1, "call_sites": 1, "conventions": 1,
+                                  "requirements": 1, "tree": tree})
+
+    def _paths(self, out):
+        m = re.search(r"```\n(.*?)\n```", out, re.S)
+        return set(m.group(1).splitlines()) if m else set()
+
+    def test_siblings_of_a_changed_file_are_listed_in_full(self):
+        make_tree(self.root, {
+            "src/a.py": "", "src/b.py": "", "src/helpers.py": "",
+            "far/away/deep/x.py": "",
+        })
+        out = review.pack_tree(self.root, {"src/a.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertIn("src/helpers.py", out)
+
+    def test_distant_deep_paths_are_pruned(self):
+        make_tree(self.root, {"src/a.py": "", "far/away/deep/x.py": ""})
+        out = review.pack_tree(self.root, {"src/a.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertNotIn("far/away/deep/x.py", out)
+
+    def test_shallow_paths_elsewhere_are_kept(self):
+        make_tree(self.root, {"src/a.py": "", "Makefile": ""})
+        out = review.pack_tree(self.root, {"src/a.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertIn("Makefile", out)
+
+    def test_pruning_keeps_exactly_the_near_and_shallow_paths(self):
+        # Real depth and shape: a directory the diff touches (kept in full even
+        # where it goes two levels deep), an unrelated directory just as deep
+        # (pruned), and a scatter of shallow non-code paths elsewhere (kept).
+        # A two-file fixture cannot exercise this — it can only ever pass or
+        # fail uniformly.
+        make_tree(self.root, {
+            "src/pkg/a.py": "x = 1\n",
+            "src/pkg/b.py": "x = 2\n",
+            "src/pkg/sub/deep/c.py": "x = 3\n",
+            "unrelated/far/away/x.py": "x = 4\n",
+            "README.md": "readme\n",
+            "Makefile": "all:\n",
+            "config/settings.yaml": "k: v\n",
+            "docs/deep/nested/guide.md": "guide\n",
+        })
+        out = review.pack_tree(self.root, {"src/pkg/a.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertEqual(self._paths(out), {
+            "src/pkg/a.py", "src/pkg/b.py",
+            "README.md", "Makefile", "config/settings.yaml",
+        })
+
+    def test_non_code_paths_are_listed_deliberately_unlike_walk_source(self):
+        # pack_tree's whole purpose is "what does this repo already have" —
+        # restricting it to CODE_SUFFIXES (as walk_source does, for the
+        # call-site grep's benefit) would silently drop README/Makefile/config
+        # paths, which are exactly the paths that answer that question.
+        make_tree(self.root, {"src/a.py": "x = 1\n", "Makefile": "all:\n", "README.md": "hi\n"})
+        out = review.pack_tree(self.root, {"src/a.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertEqual(self._paths(out), {"src/a.py", "Makefile", "README.md"})
+
+    def test_ignore_paths_are_excluded_even_when_shallow_or_near(self):
+        make_tree(self.root, {
+            "src/pkg/a.py": "x = 1\n",
+            "src/pkg/thing.lock": "lock\n",
+            "package-lock.json": "{}\n",
+            "vendor/generated/blob.py": "x = 1\n",
+        })
+        out = review.pack_tree(self.root, {"src/pkg/a.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertEqual(self._paths(out), {"src/pkg/a.py"})
+
+    def test_git_directory_is_never_listed(self):
+        make_tree(self.root, {"src/a.py": "x = 1\n", ".git/HEAD": "ref: refs/heads/main\n"})
+        out = review.pack_tree(self.root, {"src/a.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertNotIn(".git", out)
+
+    def test_truncation_is_marked_in_band_when_the_tree_exceeds_budget(self):
+        # 400 shallow files comfortably exceed a 200-character budget; a
+        # uniform tiny fixture against a huge budget would never exercise
+        # this branch at all.
+        make_tree(self.root, {f"top{i:03d}.py": "" for i in range(400)})
+        out = review.pack_tree(self.root, {}, self.cfg, self.acc(tree=200))
+        self.assertIn("truncated", out)
+
+    def test_no_checkout_yields_an_empty_section(self):
+        self.assertEqual(review.pack_tree(None, {}, self.cfg, self.acc()), "")
+
+
 if __name__ == "__main__":
     unittest.main()

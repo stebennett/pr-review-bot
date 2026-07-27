@@ -1380,6 +1380,103 @@ def pack_call_sites(
     return acc.add("call_sites", header + "\n".join(parts))
 
 
+# In precedence order. README is a fallback only: it is usually description rather
+# than instruction, and it is often long enough to crowd out the real conventions.
+CONVENTION_FILES = ("CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md")
+TREE_KEEP_DEPTH = 2
+
+
+def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]], acc: "Accounting") -> str:
+    """The conventions documents governing the changed directories.
+
+    Walks from each changed file's own directory up to the repo root, nearest
+    first, collecting every `CONVENTION_FILES` match at each level — this is
+    what lets a nested `web/AGENTS.md` say something a root `CLAUDE.md` does
+    not, and lets both apply at once to a file two levels under `web/`.
+    README is added only when nothing in `CONVENTION_FILES` was found
+    anywhere: it is usually description rather than instruction, and is often
+    long enough on its own to crowd out the real thing under the budget.
+    """
+    if root is None:
+        return ""
+
+    wanted: list[str] = []
+    dirs = {""} | {rel.rsplit("/", 1)[0] for rel in ranges if "/" in rel}
+    for d in sorted(dirs):
+        parts = d.split("/") if d else []
+        for depth in range(len(parts), -1, -1):
+            prefix = "/".join(parts[:depth])
+            for name in CONVENTION_FILES:
+                rel = f"{prefix}/{name}" if prefix else name
+                if (root / rel).is_file() and rel not in wanted:
+                    wanted.append(rel)
+
+    if not wanted and (root / "README.md").is_file():
+        wanted.append("README.md")
+    if not wanted:
+        return ""
+
+    parts_out = []
+    for rel in wanted:
+        try:
+            text = (root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        parts_out.append(f"### {rel}\n{text}\n")
+
+    header = (
+        "## Repo conventions\n\n"
+        "Context only. These are this repo's own stated rules and are what "
+        "\"consistent with the codebase\" means here — they outrank your own preferences.\n\n"
+    )
+    return acc.add("conventions", header + "\n".join(parts_out))
+
+
+def pack_tree(root: Path | None, ranges: dict[str, list[tuple[int, int]]], cfg: dict, acc: "Accounting") -> str:
+    """A pruned path listing: full detail near the change, shallow elsewhere.
+
+    This is what lets a lens notice the repo already has the helper the PR
+    reimplements. Pruned rather than flat-truncated, because an alphabetical
+    cut at N characters keeps everything under `a/` and nothing under `s/`.
+
+    Deliberately not built from `walk_source`: that walk is restricted to
+    `CODE_SUFFIXES` for the call-site grep's benefit (prose false-positives),
+    but a listing whose whole purpose is "what does this repo already have"
+    should not silently drop `README.md`, `Makefile`, and every config file —
+    those are exactly the paths that tell a lens whether something already
+    exists. So this walks the tree itself, reusing the same `.git` and
+    `ignore_paths` exclusions, but no suffix filter and no file contents (a
+    path listing never needs to read a file's bytes).
+    """
+    if root is None:
+        return ""
+
+    near = {rel.rsplit("/", 1)[0] for rel in ranges if "/" in rel}
+    ignore = cfg.get("ignore_paths") or []
+    keep: list[str] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel.startswith(".git/") or "/.git/" in f"/{rel}":
+            continue
+        if path_matches(rel, ignore):
+            continue
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        if parent in near or rel.count("/") < TREE_KEEP_DEPTH:
+            keep.append(rel)
+
+    if not keep:
+        return ""
+    header = (
+        "## Path tree (pruned)\n\n"
+        "Context only. Full listing for directories the diff touches, shallow "
+        "elsewhere. Use it to check whether something already exists before "
+        "calling it missing.\n\n"
+    )
+    return acc.add("tree", header + "```\n" + "\n".join(sorted(keep)) + "\n```\n")
+
+
 def diff_paths(diff: str) -> dict[str, list[tuple[int, int]]]:
     """path -> RIGHT-side (start, end) inclusive line ranges the diff touches.
 
@@ -1622,6 +1719,8 @@ def build_context(
             sections.append(pack_changed_files(
                 ctx.root, gh, repo, pr["head"]["sha"], ranges, cfg, acc))
             sections.append(pack_call_sites(ctx.root, diff, ranges, cfg, acc))
+            sections.append(pack_conventions(ctx.root, ranges, acc))
+            sections.append(pack_tree(ctx.root, ranges, cfg, acc))
             ctx.pack = "\n".join(s for s in sections if s)
             acc.report()
         except Exception as exc:  # noqa: BLE001 - a bad config must degrade the pack, never the review
