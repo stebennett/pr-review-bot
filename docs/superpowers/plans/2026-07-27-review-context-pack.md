@@ -2284,7 +2284,6 @@ MIN_SYMBOL_LEN = 4
 MAX_SYMBOLS = 20
 MAX_HITS_PER_SYMBOL = 3
 SYMBOL_HIT_CEILING = 40
-HIT_PAD = 8
 
 
 def changed_symbols(diff: str) -> list[str]:
@@ -2397,7 +2396,7 @@ def pack_call_sites(
     return acc.add("call_sites", header + "\n".join(parts))
 ```
 
-`HIT_PAD` is declared for symmetry with the spec's ±8 lines; single-line hits with `path:line` prefixes proved more legible per character than windows, and the budget buys more distinct hits that way. If Task 16 shows lenses cannot use bare lines, widen this to `windowed()` calls.
+**Departure from the spec, ruled before execution:** hits are single lines with `path:line` prefixes rather than the spec's ±8-line windows. Per character of budget this buys more distinct hits, which is what the part is for. No `HIT_PAD` constant is defined — an unused constant is dead code, and if Task 16 shows lenses cannot use bare lines, switching to `windowed()` here is a two-line change anyway.
 
 - [ ] **Step 6: Wire the part into `build_context`**
 
@@ -2453,7 +2452,7 @@ ceiling and the budget."
 **Interfaces:**
 - Consumes: `Accounting`, `Context.root`, `walk_source`
 - Produces:
-  - `pack_conventions(root: Path | None, ranges: dict, cfg: dict, acc: Accounting) -> str`
+  - `pack_conventions(root: Path | None, ranges: dict, acc: Accounting) -> str`
   - `pack_tree(root: Path | None, ranges: dict, cfg: dict, acc: Accounting) -> str`
 
 - [ ] **Step 1: Write the failing tests**
@@ -2474,27 +2473,27 @@ class TestPackConventions(unittest.TestCase):
 
     def test_a_root_claude_md_is_included(self):
         make_tree(self.root, {"CLAUDE.md": "Always use tabs.\n"})
-        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.cfg, self.acc())
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
         self.assertIn("Always use tabs.", out)
 
     def test_a_nearest_ancestor_file_is_included(self):
         make_tree(self.root, {"web/AGENTS.md": "Web rules.\n"})
-        out = review.pack_conventions(self.root, {"web/app/x.py": [(1, 1)]}, self.cfg, self.acc())
+        out = review.pack_conventions(self.root, {"web/app/x.py": [(1, 1)]}, self.acc())
         self.assertIn("Web rules.", out)
 
     def test_readme_is_used_only_when_nothing_else_exists(self):
         make_tree(self.root, {"README.md": "Readme text.\n"})
-        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.cfg, self.acc())
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
         self.assertIn("Readme text.", out)
 
     def test_readme_is_omitted_when_a_conventions_file_exists(self):
         make_tree(self.root, {"README.md": "Readme text.\n", "CONTRIBUTING.md": "Contribute.\n"})
-        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.cfg, self.acc())
+        out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
         self.assertIn("Contribute.", out)
         self.assertNotIn("Readme text.", out)
 
     def test_no_checkout_yields_an_empty_section(self):
-        self.assertEqual(review.pack_conventions(None, {}, self.cfg, self.acc()), "")
+        self.assertEqual(review.pack_conventions(None, {}, self.acc()), "")
 
 
 class TestPackTree(unittest.TestCase):
@@ -2547,7 +2546,7 @@ CONVENTION_FILES = ("CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md")
 TREE_KEEP_DEPTH = 2
 
 
-def pack_conventions(root: Path | None, ranges: dict, cfg: dict, acc: Accounting) -> str:
+def pack_conventions(root: Path | None, ranges: dict, acc: Accounting) -> str:
     """The conventions documents governing the changed directories."""
     if root is None:
         return ""
@@ -2614,7 +2613,7 @@ def pack_tree(root: Path | None, ranges: dict, cfg: dict, acc: Accounting) -> st
 - [ ] **Step 4: Wire both parts into `build_context`**
 
 ```python
-        sections.append(pack_conventions(ctx.root, ranges, cfg, acc))
+        sections.append(pack_conventions(ctx.root, ranges, acc))
         sections.append(pack_tree(ctx.root, ranges, cfg, acc))
 ```
 
@@ -3155,8 +3154,13 @@ git commit -m "tune: <what> after measuring on <repo>#<PR>
 
 **Two deliberate departures from the spec**, both recorded above where they occur:
 
-1. **Call-site hits are single lines with `path:line` prefixes, not ±8-line windows** (Task 11, Step 5). Per character of budget this buys more distinct hits, which is what the part is for. `HIT_PAD` is defined so widening it is a one-line change if Task 16 shows lenses cannot use bare lines.
+1. **Call-site hits are single lines with `path:line` prefixes, not ±8-line windows** (Task 11, Step 5). Per character of budget this buys more distinct hits, which is what the part is for. Switching to `windowed()` is a two-line change if Task 16 shows lenses cannot use bare lines.
 2. **`max_context_files` became a config key** rather than a bare constant (Task 10), because it is the knob most likely to need per-repo tuning on a monorepo.
+
+**Two pre-flight rulings** (asked and answered before execution began, so a reviewer flagging either is reading a stale plan):
+
+- **No `HIT_PAD` constant.** An earlier draft defined one it never used, as a signpost for the spec's ±8 lines. An unused constant is dead code; it was removed.
+- **`pack_conventions` takes no `cfg`.** An earlier draft gave it one for signature symmetry with the other `pack_*` functions and never read it. Signature symmetry does not justify an unused parameter.
 
 **One spec value not yet measured:** the spec's ~2x cost and ~50% caching saving are estimates. Task 16 Step 5 measures them and Task 15 documents the real figures.
 
