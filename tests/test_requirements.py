@@ -60,6 +60,34 @@ class TestIssueRefs(unittest.TestCase):
     def test_empty_text_is_safe(self):
         self.assertEqual(review.issue_refs("", "o/r"), [])
 
+    def test_hex_colours_and_malformed_numbers_are_rejected_exactly(self):
+        # 0 and any leading zero are never real issue numbers, so these must
+        # all come back empty. #123456 is a same-shaped false positive that
+        # cannot be told apart from a real large issue number by pattern
+        # alone — it is deliberately left matching and relies on the 404
+        # backstop in resolve_requirements() to become harmless.
+        cases = {
+            "color: #000000": [],
+            "color: #123456": [("o/r", 123456)],
+            "#0": [],
+            "#00042": [],
+            "color: #ff0000": [],
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(review.issue_refs(text, "o/r"), expected)
+
+    def test_real_references_still_resolve_exactly(self):
+        # Guards against over-tightening the digit class in the same change
+        # that rejects hex colours.
+        self.assertEqual(review.issue_refs("#42", "o/r"), [("o/r", 42)])
+        self.assertEqual(review.issue_refs("Closes #7", "o/r"), [("o/r", 7)])
+        self.assertEqual(
+            review.issue_refs("https://github.com/other/proj/issues/9", "o/r"),
+            [("other/proj", 9)],
+        )
+        self.assertEqual(review.issue_refs("#5 and #5 again", "o/r"), [("o/r", 5)])
+
 
 class TestResolveRequirements(unittest.TestCase):
     def pr(self, body="Implements #7", number=42):
@@ -192,6 +220,37 @@ class TestResolveRequirementsInteractions(unittest.TestCase):
         out = review.resolve_requirements(gh, "o/r", self.pr(body="B" * 200), tiny)
         self.assertLessEqual(len(out), 50)
         self.assertIn("requirements", tiny.truncated)
+
+    def test_human_comments_section_has_no_editorial_aside(self):
+        gh = FakeGitHub(comments={"/repos/o/r/issues/42/comments": [
+            {"user": {"login": "alice", "type": "User"}, "body": "Do not do it that way"},
+        ]})
+        out = review.resolve_requirements(gh, "o/r", self.pr(body="no refs"), acc())
+        self.assertIn("### Human comments on this PR", out)
+        self.assertIn("Do not do it that way", out)
+        self.assertNotIn("Requirements as stated by people, not by the description.", out)
+
+    def test_a_mid_list_issue_failure_does_not_take_down_the_others(self):
+        class FlakyGitHub:
+            """Issue #3 (of 5 referenced) always raises; the rest resolve fine."""
+
+            def __init__(self):
+                self.calls = []
+
+            def get(self, path):
+                self.calls.append(path)
+                if path.endswith("/comments"):
+                    return []
+                number = int(path.rsplit("/", 1)[-1])
+                if number == 3:
+                    raise RuntimeError("issue 3 is unreachable")
+                return {"title": f"Issue {number}", "body": f"Body {number}"}
+
+        body = " ".join(f"#{n}" for n in range(1, 6))  # #1 #2 #3 #4 #5
+        out = review.resolve_requirements(FlakyGitHub(), "o/r", self.pr(body=body), acc())
+        for n in (1, 2, 4, 5):
+            self.assertIn(f"Issue {n}", out)
+        self.assertNotIn("Issue 3", out)
 
 
 if __name__ == "__main__":

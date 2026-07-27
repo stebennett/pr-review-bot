@@ -1711,10 +1711,20 @@ class Context:
 
 
 # `#42`, `Closes #42`, and full issue/PR URLs including cross-repo ones. The
-# negative lookbehind keeps hex colours and anchors from parsing as references.
+# negative lookbehind keeps anchors from parsing as references, and the digit
+# class (leading digit 1-9, never 0) rules out the common hex-colour shapes —
+# a GitHub issue number is never 0 and never written with a leading zero, so
+# `#000000`, `#0` and `#00042` never match at all. A same-shaped false positive
+# that slips through anyway (a bare six-digit number like `#123456`, which is
+# indistinguishable from a real large issue number by pattern alone) is left
+# to the 404 it gets when resolve_requirements() tries to fetch it — that
+# fetch-and-skip is the deliberate backstop for this pattern, not an accident.
+# A reference inside a markdown code span (`` `#42` ``) is also left matching
+# on purpose: it may well be a genuine reference, and the same backstop makes
+# an imprecise match harmless either way.
 ISSUE_REF_RE = re.compile(
-    r"https?://github\.com/(?P<orepo>[\w.-]+/[\w.-]+)/(?:issues|pull)/(?P<onum>\d+)"
-    r"|(?<![\w#])#(?P<num>\d{1,7})\b"
+    r"https?://github\.com/(?P<orepo>[\w.-]+/[\w.-]+)/(?:issues|pull)/(?P<onum>[1-9]\d{0,6})"
+    r"|(?<![\w#])#(?P<num>[1-9]\d{0,6})\b"
 )
 MAX_LINKED_ISSUES = 5
 
@@ -1770,10 +1780,7 @@ def resolve_requirements(gh, repo: str, pr: dict, acc: Accounting) -> str:
                 f"**{(c.get('user') or {}).get('login', '?')}**: {(c.get('body') or '').strip()}"
                 for c in human
             )
-            parts.append(
-                "### Human comments on this PR\n"
-                "Requirements as stated by people, not by the description.\n\n" + rendered
-            )
+            parts.append("### Human comments on this PR\n" + rendered)
 
     return acc.add("requirements", "\n\n".join(parts))
 
