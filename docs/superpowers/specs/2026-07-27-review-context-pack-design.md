@@ -1,4 +1,4 @@
-# Context pack: giving the lenses more than the diff
+# Context pack and prompt caching: giving the lenses more than the diff
 
 **Date:** 2026-07-27
 **Status:** approved, not yet implemented
@@ -25,9 +25,9 @@ The reviewer therefore cannot see four things it is doctrinally supposed to see:
 
 ## Approach
 
-Assemble a **context pack** in ordinary deterministic code before dispatching the panel,
-and append it to each lens's user message. Still exactly one model call per lens, four per
-PR. No agentic tool loop, no new model call, no new dependency.
+Assemble a **context pack** in ordinary deterministic code before dispatching the panel, and
+place it in the shared, cacheable region of each lens's user message. Still exactly one model
+call per lens, four per PR. No agentic tool loop, no new model call, no new dependency.
 
 Two approaches were rejected:
 
@@ -43,7 +43,9 @@ Two approaches were rejected:
   — is exactly what the hybrid needs, so nothing here is wasted.
 
 Expected cost: ~21k tokens of pack on top of a ~30k-token diff, three times over. Roughly
-2x the current ~$0.11 per PR.
+2x the current ~$0.11 per PR — brought back to approximately today's cost by the prompt
+caching described below, which is what makes the pack affordable rather than merely
+possible.
 
 ## Acquisition
 
@@ -136,14 +138,116 @@ prepended, so a PR with no linked issues degrades to exactly today's behaviour.
 
 ## Prompt placement
 
-Requirements stay where they are in `run_lens`, ahead of the diff, because they frame the
-read. Changed-file context, call sites, conventions and the tree go **after** the diff,
-because they are lookups. The tail instruction stays last so the binding constraint is the
-final thing read.
+The prompt is ordered **shared-first, lens-specific-last**, so that everything identical
+across the three lenses forms one byte-identical cacheable prefix. See "Prompt caching"
+below for why this shape is load-bearing rather than cosmetic.
+
+1. `agents/pr-review-lens.md` + `lenses/_shared.md` — shared doctrine. **Cache breakpoint.**
+2. PR title, PR body, resolved requirements, prior recommendations, the diff, then the four
+   remaining pack parts. **Cache breakpoint.**
+3. `lens: <name>`, that lens's brief from `lenses/<lens>.md`, and the tail instruction.
+
+Within block 2 the requirements stay ahead of the diff, because they frame the read, and
+changed-file context, call sites, conventions and the tree come after it, because they are
+lookups. Block 3 is last so the binding constraint — scope fence and anchoring rule — is
+the final thing read before generation.
+
+Two consequences of this ordering, both deliberate:
+
+- **`lens: <name>` moves to block 3.** It currently opens the user message at
+  `review.py:683`. It cannot stay there: a per-lens token anywhere in blocks 1–2 destroys
+  the shared prefix for all three calls.
+- **The lens brief moves out of the system prompt.** It is currently the third element of
+  `system`. Recency arguably favours the new position, since the brief is what narrows
+  scope, but this is a change to the part of the system that determines review quality and
+  it must be A/B'd on its own — see Verification.
 
 The tail instruction is rewritten: you have a context pack but still no tools; every
 finding must anchor to a line the diff touches; a truncation marker means you have not seen
 that code.
+
+## Prompt caching
+
+The pack roughly doubles lens input tokens, and every one of those tokens is **identical
+across the three lenses**. Caching the shared prefix is therefore not an optimisation bolted
+on afterwards — it is what keeps the pack affordable.
+
+Two cacheable regions, per the block structure above. Both ship; the labels are referred to
+by name later in this document.
+
+- **Tier 1 — block 1, the shared doctrine (~5k tokens).** Identical across the three lenses
+  *and* across every PR in a queue pass. Cacheable with no restructuring at all, since
+  `run_lens` already concatenates the shared doctrine ahead of the lens brief. Worth roughly
+  5% of lens input, and carries no risk to review quality.
+- **Tier 2 — blocks 1+2, doctrine plus diff plus pack (~56k tokens).** The large win, and
+  the reason for the reordering. Divergent tail is ~1.5k tokens.
+
+Against three uncached passes of ~57.5k input tokens each, one cache write at 1.25x plus two
+reads at 0.1x gives roughly **half** the lens input cost. The 0.1x read multiplier is the
+Anthropic and DeepSeek figure; OpenAI-family providers are nearer 0.25–0.5x, so the saving
+varies by route.
+
+### Staggered dispatch
+
+Three lenses dispatched in parallel all miss a cold cache and all three *write* it at 1.25x
+— **strictly worse than not caching**. So `run_panel` changes from one parallel wave to:
+
+1. Run the first lens alone. It writes the cache.
+2. Run the remaining lenses in parallel. They read it.
+
+Order is `LENSES` order, so `requirements` goes first — deterministic, and it does not
+matter which. With `--lens` selecting a single lens there is nothing to stagger and the
+staggering is skipped.
+
+Wall clock goes from one lens-latency to two: roughly 60s to 120s on a typical PR. For a
+scheduled pass this is immaterial, and it is the accepted price of the Tier 2 saving.
+
+If the first lens fails outright, the remaining two dispatch in parallel and simply miss the
+cache. Log it; do not retry for the cache's sake. Note also that an Anthropic-style
+ephemeral cache has a 5-minute TTL, so the first lens's three-attempt retry ladder with
+backoff can in principle outlive the window — another reason the miss must be handled as
+normal rather than as an error.
+
+### Mechanics
+
+`cache_control` markers live on message content blocks, so `openrouter()` must accept
+content-block arrays rather than only strings:
+
+```python
+def seg(text: str, *, cache: bool = False) -> dict:
+    """One content block, optionally closing a cache prefix."""
+
+def openrouter(model, system, user, schema, *, label) -> dict:
+    """`system` and `user` each accept str | list[dict]; a str is wrapped."""
+```
+
+Two breakpoints are used, well inside the four-breakpoint limit that explicit-cache
+providers impose.
+
+### Provider risk, and how it is verified
+
+Caching is provider-specific: automatic on DeepSeek and OpenAI-family models, explicit via
+`cache_control` on Anthropic. Whether the default `MODEL_LENS` (`z-ai/glm-5.2`) routes to a
+provider that honours explicit `cache_control` is **not assumed by this design** and must be
+measured. There is also an open question about whether
+`provider: {"require_parameters": True}` at `review.py:391` narrows or fails routing once
+`cache_control` appears in the messages — that flag exists to stop a provider silently
+ignoring `response_format`, and its interaction with cache markers needs checking before
+this ships.
+
+So the design requires measurement rather than trust:
+
+- Every model call logs `usage.prompt_tokens_details.cached_tokens` and `cache_discount`
+  from the OpenRouter response alongside the existing in/out token counts.
+- `--no-cache`, and a `cache` config key, turn the markers off.
+
+**If lenses 2 and 3 report zero cached tokens, caching is not working on that route and it
+must be turned off** — on an explicit-cache provider you would otherwise pay the 1.25x write
+premium three times for no reads. A silent cache miss is more expensive than no caching, so
+this log line is a requirement, not a diagnostic nicety.
+
+The adjudication call is not cached. It runs once per PR with no shared prefix to exploit,
+and its doctrine is small.
 
 ## What reaches the adjudicator
 
@@ -181,25 +285,39 @@ def build_context(gh, repo, pr, diff, cfg, *, enabled, worktree=None) -> Context
 ```
 
 Supporting helpers: `fetch_checkout`, `diff_paths`, `changed_symbols`, `grep_repo`, and one
-`pack_*` function per part. `run_lens` grows a `pack` parameter and `run_panel` threads it
-through.
+`pack_*` function per part.
+
+Three existing functions change:
+
+- **`run_lens`** grows a `pack` parameter, and returns its prompt as content-block arrays
+  rather than strings, with the block order given under "Prompt placement".
+- **`run_panel`** threads the pack through and replaces its single
+  `ThreadPoolExecutor` wave with the staggered dispatch described under "Prompt caching".
+  Its existing per-lens failure handling — an exception becomes a `needs-input` envelope
+  rather than aborting the panel — must survive the restructure unchanged.
+- **`openrouter`** accepts `str | list[dict]` for `system` and `user`, and logs cached-token
+  counts.
 
 ## Configuration
 
-Three new keys in `DEFAULTS`, tunable per-repo via `.claude/pr-reviewer.json`:
+Four new keys in `DEFAULTS`, tunable per-repo via `.claude/pr-reviewer.json`:
 
 ```json
 {
   "context": true,
   "max_context_chars": 83000,
-  "max_tarball_bytes": 50000000
+  "max_tarball_bytes": 50000000,
+  "cache": true
 }
 ```
 
-Two new CLI flags:
+Three new CLI flags:
 
 - `--no-context` — disable the pack. This is what makes before/after comparison possible,
   and it is the escape hatch when the pack misbehaves on a specific repo.
+- `--no-cache` — drop the `cache_control` markers and revert to a single parallel dispatch
+  wave. Needed for the A/B in Verification, and the escape hatch when a route does not
+  honour caching.
 - `--worktree PATH` — use a local checkout instead of fetching a tarball, so offline
   `--diff-file` mode gets a real pack. Without it, offline mode has no repo and therefore
   no pack; requirements remain whatever `--body` supplies.
@@ -221,9 +339,15 @@ the single most useful signal for whether the pack is helping or eroding discipl
 
 ## Doctrine changes
 
-One paragraph. Bullet 1 of the porting note in `doctrine/agents/pr-review-lens.md` is
-rewritten: you have no tools, but you are given a context pack; read around the diff there;
-a truncation marker means code you have not seen.
+Confined to the porting note in `doctrine/agents/pr-review-lens.md`, in two places:
+
+- **Bullet 1** is rewritten: you have no tools, but you are given a context pack; read
+  around the diff there; a truncation marker means code you have not seen.
+- **The closing paragraph** currently says the briefs "are already concatenated into this
+  prompt, and the diff is in the user message". After the reorder the shared doctrine is in
+  the system prompt and the lens brief arrives at the *end* of the user message, so this
+  sentence has to say where each piece actually is — otherwise a lens told to "read
+  `_shared.md` first, then your own brief" has no way to know it already has both.
 
 `doctrine/lenses/_shared.md`, the three lens briefs and `doctrine/verdict.md` are
 untouched, so parity with the upstream `pr-reviewer` plugin in `stebennett/nyx-claude`
@@ -232,32 +356,76 @@ porting note or the user-message tail, never in the shared doctrine.
 
 ## Verification
 
-There is no test suite; verification means running offline mode against a diff you know
-well, with `--worktree` pointing at a checkout of it:
+There is no test suite; verification means running offline mode against a diff you know well
+and reading the output. Two changes here alter review quality independently — the prompt
+reorder and the pack — so they must be verified in sequence, not together.
+
+**`--no-cache` cannot un-reorder the prompt**: the block structure is structural, not
+flag-controlled. So the reorder has to be verified while it is still the *only* change,
+before the pack exists to confound it. This is a hard sequencing constraint on the
+implementation plan, not a preference.
+
+### Step 1 — the reorder and caching, with no pack
+
+The baseline must be captured **before any code changes**, as the first action of the
+implementation plan — not recovered by stashing later, since by then the change is committed
+on the branch:
 
 ```bash
 gh pr diff 42 > /tmp/x.diff
+python3 review.py --diff-file /tmp/x.diff --save /tmp/base.json -v   # on main, before touching anything
+```
+
+Then, with the reorder and caching in place and the pack not yet built:
+
+```bash
+python3 review.py --diff-file /tmp/x.diff --save /tmp/reordered.json -v
+```
+
+Keep `/tmp/x.diff` and `/tmp/base.json` for the whole exercise; regenerating the diff later
+invalidates the comparison.
+
+Read for:
+
+1. **Are the findings equivalent?** Not identical — temperature 0 does not guarantee
+   stability across a changed prompt — but the same blocking findings should survive. A
+   lens that stops filing findings, or starts wandering outside its lens, means moving the
+   brief out of the system prompt cost discipline, and the reorder should be reconsidered
+   rather than patched over.
+2. **Do lenses 2 and 3 report non-zero `cached_tokens`?** If not, caching is not working on
+   this route: set `cache: false` and drop back to Tier 1 or to no caching. Do not ship the
+   staggered dispatch without cache reads, because it buys latency for nothing.
+3. **Is `cache_discount` consistent with roughly half the lens input cost?** This is the
+   whole justification for the tier.
+
+### Step 2 — the pack, on top
+
+```bash
 python3 review.py --diff-file /tmp/x.diff --no-context --save /tmp/before.json -v
 python3 review.py --diff-file /tmp/x.diff --worktree ~/Code/thatrepo --save /tmp/after.json -v
 ```
 
-Three things to read from the comparison:
+Read for:
 
 1. Did new findings appear that **genuinely needed** context — a caller, a convention, an
    existing utility — rather than just more findings?
-2. Did the anchor-violation count stay at zero?
+2. Did the anchor-violation count stay at zero? This is the pack's characteristic new
+   failure mode.
 3. Did any part's budget bite? Each part logs chars used against chars allowed. This line
    is part of the build, not an afterthought: without it an empty part is
    indistinguishable from a truncated one.
 
-Also confirm the degradation ladder by hand: point `--worktree` at a nonexistent path and
-at a directory that is not a checkout, and confirm the review still completes with a
-smaller pack rather than failing.
+### Step 3 — degradation, by hand
+
+Point `--worktree` at a nonexistent path and at a directory that is not a checkout, and
+confirm the review still completes with a smaller pack rather than failing. Against a real
+PR, confirm the per-file fallback by setting `max_tarball_bytes` low enough to force it.
 
 ## Out of scope
 
 - The hybrid `needs-context` re-dispatch round.
-- Prompt caching of the shared pack prefix across the three lenses. It would cut cost, but
-  the lenses dispatch in parallel with differing system prompts, so there is no shared
-  prefix to hit and the cache writes would race. Revisit only if cost becomes a problem.
+- Caching the adjudication call. One call per PR, no shared prefix, small doctrine.
+- Cross-pass caching of the diff-and-pack region. An ephemeral cache has a 5-minute TTL and
+  a re-review lands hours or days later, so only the doctrine prefix survives between PRs —
+  and that falls out of Tier 1 for free.
 - Any change to merging, posting or state. v1 remains review-only and stateless.
