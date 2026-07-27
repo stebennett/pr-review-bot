@@ -2,6 +2,8 @@
 
 import pathlib
 import sys
+import threading
+import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -159,6 +161,59 @@ class TestLensPromptBlocks(unittest.TestCase):
     def test_an_absent_pack_leaves_no_dangling_heading(self):
         _, user = self.build("craft", pack="")
         self.assertNotIn("## Context", user[0]["text"])
+
+
+class TestDispatchLenses(unittest.TestCase):
+    def test_the_first_lens_finishes_before_the_others_start(self):
+        events = []
+
+        def runner(lens):
+            events.append(("start", lens))
+            time.sleep(0.05)
+            events.append(("end", lens))
+            return {"lens": lens}
+
+        review.dispatch_lenses(("a", "b", "c"), runner, stagger=True)
+        self.assertEqual(events[0], ("start", "a"))
+        self.assertEqual(events[1], ("end", "a"))
+
+    def test_results_come_back_in_lens_order_not_completion_order(self):
+        def runner(lens):
+            time.sleep({"a": 0.06, "b": 0.02, "c": 0.04}[lens])
+            return {"lens": lens}
+
+        out = review.dispatch_lenses(("a", "b", "c"), runner, stagger=True)
+        self.assertEqual([e["lens"] for e in out], ["a", "b", "c"])
+
+    def test_the_trailing_lenses_run_concurrently(self):
+        barrier = threading.Barrier(2, timeout=2)
+
+        def runner(lens):
+            if lens != "a":
+                barrier.wait()  # BrokenBarrierError unless b and c overlap
+            return {"lens": lens}
+
+        review.dispatch_lenses(("a", "b", "c"), runner, stagger=True)
+
+    def test_unstaggered_dispatch_runs_every_lens_concurrently(self):
+        barrier = threading.Barrier(3, timeout=2)
+
+        def runner(lens):
+            barrier.wait()
+            return {"lens": lens}
+
+        review.dispatch_lenses(("a", "b", "c"), runner, stagger=False)
+
+    def test_a_single_lens_needs_no_staggering(self):
+        out = review.dispatch_lenses(("a",), lambda lens: {"lens": lens}, stagger=True)
+        self.assertEqual(out, [{"lens": "a"}])
+
+    def test_a_runner_exception_propagates_rather_than_being_swallowed(self):
+        def runner(lens):
+            raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            review.dispatch_lenses(("a",), runner, stagger=True)
 
 
 if __name__ == "__main__":

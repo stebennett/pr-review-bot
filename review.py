@@ -856,26 +856,51 @@ def post_review(gh: GitHub, repo: str, number: int, verdict: dict, *, post: bool
         log(f"  posted {event} with {len(comments)} finding(s) inlined into the body")
 
 
+def dispatch_lenses(lenses: tuple[str, ...], runner, *, stagger: bool) -> list[dict]:
+    """Run every lens, returning envelopes in `lenses` order.
+
+    With `stagger`, the first lens runs alone so that it writes the shared cache
+    prefix, and the rest then read it. Three cold parallel calls would each pay
+    the cache-write premium and none would read — worse than not caching at all.
+    The cost is wall clock: one lens-latency becomes two.
+
+    `runner` must not raise for a merely-failed lens; run_panel wraps it so a
+    failure becomes a needs-input envelope instead of losing the whole panel.
+    """
+    head: tuple[str, ...] = ()
+    tail = lenses
+    if stagger and len(lenses) > 1:
+        head, tail = lenses[:1], lenses[1:]
+
+    results = {lens: runner(lens) for lens in head}
+
+    if tail:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(tail)) as pool:
+            futures = {pool.submit(runner, lens): lens for lens in tail}
+            for fut in concurrent.futures.as_completed(futures):
+                results[futures[fut]] = fut.result()
+
+    return [results[lens] for lens in lenses]
+
+
 def run_panel(pr: dict, repo: str, diff: str, requirements: str, opts: argparse.Namespace) -> dict | None:
     """Three lenses in parallel, then adjudication. None if nothing to adjudicate."""
     lenses = tuple(opts.lens) if opts.lens else LENSES
     log(f"  dispatching {len(lenses)} lens(es) over {diff_size(diff)} changed lines")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(lenses)) as pool:
-        futures = {
-            pool.submit(run_lens, lens, pr, repo, diff, requirements, "", opts.model_lens): lens
-            for lens in lenses
-        }
-        envelopes = []
-        for fut in concurrent.futures.as_completed(futures):
-            lens = futures[fut]
-            try:
-                envelopes.append(fut.result())
-            except Exception as exc:  # noqa: BLE001
-                log(f"    lens:{lens} FAILED: {exc}")
-                envelopes.append(
-                    {"lens": lens, "status": "needs-input", "findings": [], "notes": f"failed: {exc}"}
-                )
+    def runner(lens: str) -> dict:
+        # A failed lens must not lose the other two, so the envelope is
+        # synthesised here rather than allowed to escape dispatch_lenses.
+        try:
+            return run_lens(lens, pr, repo, diff, requirements, "", opts.model_lens)
+        except Exception as exc:  # noqa: BLE001
+            log(f"    lens:{lens} FAILED: {exc}")
+            return {"lens": lens, "status": "needs-input", "findings": [], "notes": f"failed: {exc}"}
+
+    stagger = CACHE_ENABLED and len(lenses) > 1
+    if stagger:
+        log(f"  staggering: {lenses[0]} first to write the cache, then {len(lenses) - 1} in parallel")
+    envelopes = dispatch_lenses(lenses, runner, stagger=stagger)
 
     if all(e["status"] == "needs-input" for e in envelopes):
         log("  all lenses failed — nothing to adjudicate")
