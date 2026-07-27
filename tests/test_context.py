@@ -1,7 +1,9 @@
 """Context pack assembly. No network: checkouts are built locally with tarfile."""
 
+import os
 import pathlib
 import re
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -888,6 +890,27 @@ class TestChangedSymbols(unittest.TestCase):
         self.assertEqual(len(out), review.MAX_SYMBOLS)
         self.assertEqual(out, names[: review.MAX_SYMBOLS])
 
+    def test_prose_in_a_markdown_hunk_contributes_no_symbol_but_a_code_hunk_does(self):
+        # Finding 4 (round 1 review): DEF_RE's bare "type <name>" alternative
+        # fires on ordinary English sentences with no idea what file it is
+        # reading. Attributing each hunk to its own path via _hunks() and
+        # skipping non-code files fixes it — this diff's markdown hunk reads
+        # "a type explaining the split", which would previously have yielded
+        # "explaining"; the code hunk right after it must still work.
+        diff = (
+            "diff --git a/docs/notes.md b/docs/notes.md\n"
+            "--- a/docs/notes.md\n"
+            "+++ b/docs/notes.md\n"
+            "@@ -1,1 +1,1 @@\n"
+            "+a type explaining the split\n"
+            "diff --git a/src/real.py b/src/real.py\n"
+            "--- a/src/real.py\n"
+            "+++ b/src/real.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "+def real_symbol():\n"
+        )
+        self.assertEqual(review.changed_symbols(diff), ["real_symbol"])
+
 
 class TestGrepRepo(unittest.TestCase):
     def setUp(self):
@@ -964,6 +987,54 @@ class TestGrepRepo(unittest.TestCase):
         )
         self.assertEqual(len(hits["beta_thing"]), 1)
         self.assertEqual(len(hits["gamma_thing"]), 1)
+
+    def test_a_markdown_mention_is_not_a_hit_but_a_code_reference_is(self):
+        # Finding 3 (round 1 review): an unrestricted walk cannot distinguish
+        # a doc file quoting an identifier from a genuine call site. Exact hit
+        # set, not assertIn: a regression here would silently ADD a doc hit
+        # alongside the real one rather than replace it.
+        make_tree(self.root, {
+            "docs/notes.md": "See fetch_user for details.\nfetch_user again here.\n",
+            "src/caller.py": "fetch_user(1)\n",
+        })
+        hits = review.grep_repo(self.root, ["fetch_user"], self.cfg, exclude=set(), max_hits=40)
+        self.assertEqual(
+            [(rel, ln) for rel, ln, _ in hits["fetch_user"]],
+            [("src/caller.py", 1)],
+        )
+
+    def test_non_code_suffixes_are_never_walked(self):
+        # Direct guard on walk_source's own contract, independent of any
+        # particular needle: nothing outside CODE_SUFFIXES is ever yielded,
+        # so it cannot appear in ANY needle's hits, present or future.
+        make_tree(self.root, {
+            "README.md": "shared_token\n",
+            "data.json": "shared_token\n",
+            "notes.txt": "shared_token\n",
+            "src/real.py": "shared_token\n",
+        })
+        rels = {rel for rel, _text in review.walk_source(self.root, self.cfg)}
+        self.assertEqual(rels, {"src/real.py"})
+
+
+class TestModuleStem(unittest.TestCase):
+    def test_a_test_suffixed_typescript_file_yields_the_bare_module_name(self):
+        # Finding 2 (round 1 review): stripping only the final extension left
+        # ".test" glued to the stem, so the needle could only ever match the
+        # test file's own name, never a real `import HandicapHero`.
+        self.assertEqual(
+            review._module_stem("apps/web/src/dashboard/HandicapHero.test.tsx"),
+            "HandicapHero",
+        )
+
+    def test_a_spec_suffixed_javascript_file_yields_the_bare_module_name(self):
+        self.assertEqual(review._module_stem("src/Sparkline.spec.js"), "Sparkline")
+
+    def test_an_ordinary_module_file_is_unaffected(self):
+        self.assertEqual(review._module_stem("src/trends/handicapModel.ts"), "handicapModel")
+
+    def test_a_bare_filename_with_no_directory_still_works(self):
+        self.assertEqual(review._module_stem("api.py"), "api")
 
 
 class TestPackCallSites(unittest.TestCase):
@@ -1051,6 +1122,82 @@ class TestPackCallSites(unittest.TestCase):
         self.assertLessEqual(len(out), 200)
         self.assertIn("call_sites", acc.truncated)
         self.assertIn("…", out)
+
+
+class TestPackCallSitesDeterminism(unittest.TestCase):
+    """Finding 1 (round 1 review): iterating `set(ranges)` to build importer
+    needles made which module stems survive the 20-slot cap depend on
+    CPython's per-process string-hash randomisation — same diff, same
+    checkout, different section. Fixed by iterating `ranges` (an
+    insertion-ordered dict) directly.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _big_fixture(self, prefix: str, n: int = 30):
+        """`n` (> MAX_SYMBOLS) changed files, each importer-worthy and each
+        imported from its own caller file, plus the `ranges`/files dicts
+        needed to drive `pack_call_sites` from modules alone (diff="").
+        """
+        names = [f"{prefix}_{i:03d}" for i in range(n)]
+        files, ranges = {}, {}
+        for i, name in enumerate(names):
+            rel = f"src/{name}.py"
+            files[rel] = f"x = {i}\n"
+            ranges[rel] = [(1, 1)]
+            files[f"callers/c{i}.py"] = f"import {name}\n"
+        return names, files, ranges
+
+    def test_the_surviving_needles_are_exactly_the_first_ranges_entries_in_order(self):
+        # A fixture too small to force a choice would pass even with the old
+        # set-based code most of the time; 30 candidates against a 20-slot
+        # cap forces the ordering to actually decide who is dropped, and the
+        # dropped set is pinned exactly rather than merely "some are missing".
+        names, files, ranges = self._big_fixture("stem")
+        make_tree(self.root, files)
+        cfg = dict(review.DEFAULTS)
+        acc = review.Accounting({"changed_files": 1, "call_sites": 50000, "conventions": 1,
+                                  "requirements": 1, "tree": 1})
+        out = review.pack_call_sites(self.root, "", ranges, cfg, acc)
+        found = set(re.findall(r"### `([^`]+)`", out))
+        self.assertEqual(found, set(names[: review.MAX_SYMBOLS]))
+
+    def test_the_section_is_byte_identical_across_python_hash_seeds(self):
+        # The direct regression guard for Finding 1: run the same call in
+        # fresh subprocesses under different PYTHONHASHSEED values (which
+        # only affects str hashing, and therefore only a *set's* iteration
+        # order — dict insertion order is unaffected by it either way) and
+        # assert the produced section is byte-for-byte identical every time.
+        # This would have failed under the old `for rel in set(ranges):` code.
+        names, files, ranges = self._big_fixture("seed")
+        make_tree(self.root, files)
+
+        review_dir = str(pathlib.Path(review.__file__).resolve().parent)
+        script = (
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {review_dir!r})\n"
+            "import review\n"
+            f"ranges = {ranges!r}\n"
+            "cfg = dict(review.DEFAULTS)\n"
+            "acc = review.Accounting({'changed_files': 1, 'call_sites': 50000,\n"
+            "                         'conventions': 1, 'requirements': 1, 'tree': 1})\n"
+            f"out = review.pack_call_sites(pathlib.Path({str(self.root)!r}), '', ranges, cfg, acc)\n"
+            "sys.stdout.write(out)\n"
+        )
+        outputs = []
+        for seed in ("0", "1", "42"):
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True, text=True, check=True,
+            )
+            outputs.append(proc.stdout)
+        self.assertTrue(outputs[0], "the fixture produced nothing; it proves nothing")
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0], outputs[2])
 
 
 if __name__ == "__main__":

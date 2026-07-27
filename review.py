@@ -1118,132 +1118,6 @@ def pack_changed_files(
     return acc.add("changed_files", assembled)
 
 
-# Definition-shaped lines across the languages this reviews in practice. Deliberately
-# language-agnostic and deliberately imprecise: over-matching is bounded by the hit
-# ceiling and the budget, whereas a per-language parser would be a dependency.
-DEF_RE = re.compile(
-    r"\b(?:def|class|func|fn|type|interface|struct|"
-    r"function|export\s+(?:const|function|class|type|interface|default)|const|let|var)\s+"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
-)
-
-# Names too generic for a grep to say anything useful about.
-SYMBOL_STOPLIST = {
-    "value", "values", "index", "result", "results", "data", "item", "items", "name",
-    "names", "self", "this", "true", "false", "null", "none", "type", "types", "main",
-    "test", "tests", "error", "errors", "config", "options", "params", "args", "kwargs",
-    "string", "number", "object", "array", "list", "dict", "props", "state", "default",
-}
-MIN_SYMBOL_LEN = 4
-MAX_SYMBOLS = 20
-MAX_HITS_PER_SYMBOL = 3
-SYMBOL_HIT_CEILING = 40
-
-
-def changed_symbols(diff: str) -> list[str]:
-    """Definition-shaped identifiers on the diff's added and removed lines.
-
-    These are the names whose call sites a reviewer would grep for. Order is
-    first-seen so the result is deterministic across runs.
-    """
-    seen: list[str] = []
-    for line in diff.splitlines():
-        if not line[:1] in ("+", "-") or line.startswith(("+++", "---")):
-            continue
-        for m in DEF_RE.finditer(line[1:]):
-            name = m.group("name")
-            if len(name) < MIN_SYMBOL_LEN or name.lower() in SYMBOL_STOPLIST:
-                continue
-            if name not in seen:
-                seen.append(name)
-    return seen[:MAX_SYMBOLS]
-
-
-def walk_source(root: Path, cfg: dict):
-    """Yield (relpath, text) for every readable text file under `root`."""
-    ignore = cfg.get("ignore_paths") or []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root).as_posix()
-        if rel.startswith(".git/") or "/.git/" in f"/{rel}":
-            continue
-        if path_matches(rel, ignore):
-            continue
-        try:
-            if path.stat().st_size > MAX_SOURCE_BYTES:
-                continue
-            data = path.read_bytes()
-        except OSError:
-            continue
-        if is_binary(data):
-            continue
-        yield rel, data.decode("utf-8", "replace")
-
-
-def grep_repo(
-    root: Path, needles: list[str], cfg: dict, *, exclude: set[str], max_hits: int
-) -> dict[str, list[tuple[str, int, str]]]:
-    """needle -> up to `max_hits` (relpath, lineno, line) matches outside `exclude`.
-
-    A needle exceeding SYMBOL_HIT_CEILING total matches is dropped entirely rather
-    than sampled: a name that appears everywhere tells a reviewer nothing and would
-    crowd out one that appears twice in the file that matters.
-    """
-    if not needles:
-        return {}
-    counts = {n: 0 for n in needles}
-    hits: dict[str, list[tuple[str, int, str]]] = {n: [] for n in needles}
-    for rel, text in walk_source(root, cfg):
-        if rel in exclude:
-            continue
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            for needle in needles:
-                if needle in line:
-                    counts[needle] += 1
-                    if len(hits[needle]) < max_hits:
-                        hits[needle].append((rel, lineno, line.strip()))
-    return {n: h for n, h in hits.items() if h and counts[n] <= SYMBOL_HIT_CEILING}
-
-
-def pack_call_sites(
-    root: Path | None, diff: str, ranges: dict[str, list[tuple[int, int]]],
-    cfg: dict, acc: "Accounting",
-) -> str:
-    """Call sites of changed symbols, and importers of changed modules."""
-    if root is None:
-        return ""
-
-    changed = set(ranges)
-    symbols = changed_symbols(diff)
-    # Importers are cheaper and more precise than symbol matching, so they run even
-    # when nothing definition-shaped changed.
-    modules = []
-    for rel in changed:
-        stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-        if len(stem) >= MIN_SYMBOL_LEN and stem.lower() not in SYMBOL_STOPLIST:
-            modules.append(stem)
-
-    needles = list(dict.fromkeys(symbols + modules))[:MAX_SYMBOLS]
-    found = grep_repo(root, needles, cfg, exclude=changed, max_hits=MAX_HITS_PER_SYMBOL)
-    if not found:
-        return ""
-
-    parts = []
-    for needle, hits in found.items():
-        rendered = "\n".join(f"{rel}:{lineno}: {line}" for rel, lineno, line in hits)
-        parts.append(f"### `{needle}`\n```\n{rendered}\n```\n")
-
-    header = (
-        "## Call sites and importers outside the diff\n\n"
-        "Context only, found by grep over the checkout. Use these to judge whether a "
-        "changed signature, return shape or invariant breaks something the diff does not "
-        "show. Matching is textual, so a hit may be unrelated — read it before relying on "
-        "it, and anchor any finding to the diff line that causes the problem.\n\n"
-    )
-    return acc.add("call_sites", header + "\n".join(parts))
-
-
 HUNK_RE = re.compile(r"^@@ -(?P<old>\d+)(?:,(?P<oldc>\d+))? \+(?P<new>\d+)(?:,(?P<newc>\d+))? @@")
 
 
@@ -1306,6 +1180,204 @@ def _hunks(diff: str) -> list[tuple[str | None, str | None, int, int, list[str]]
             body.append(line)
     close()
     return out
+
+
+# Extensions this reviews as code for the purposes of symbol extraction and the
+# repo-wide grep. A generous but finite list: a repo whose code lives entirely
+# under an unlisted extension loses this context section outright, which is a
+# safe degradation (the pack still ships, just thinner) rather than a crash —
+# but it is a real limitation worth knowing about rather than a fully general
+# answer to "what is source code".
+CODE_SUFFIXES = {
+    ".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".rs", ".java",
+    ".kt", ".rb", ".php", ".cs", ".swift", ".scala", ".c", ".h", ".cpp", ".hpp", ".cc", ".sh",
+}
+
+
+def _suffix(rel: str) -> str:
+    """The lowercased extension of a relpath's basename, `""` if it has none."""
+    base = rel.rsplit("/", 1)[-1]
+    return f".{base.rsplit('.', 1)[-1].lower()}" if "." in base else ""
+
+
+def _module_stem(rel: str) -> str:
+    """A changed file's importer needle: its basename, minus the language
+    extension and, separately, a trailing `.test`/`.spec` marker.
+
+    Stripping only the final extension leaves `.test`/`.spec` glued onto the
+    stem for the very common `name.test.ts` / `name.spec.js` convention, and a
+    needle like `HandicapHero.test` can only ever match a literal mention of
+    the test file's own name — never a real `import HandicapHero`. Both
+    markers are stripped so the needle is the name real code actually imports.
+    """
+    base = rel.rsplit("/", 1)[-1]
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    for marker in (".test", ".spec"):
+        if stem.lower().endswith(marker):
+            stem = stem[: -len(marker)]
+            break
+    return stem
+
+
+# Definition-shaped lines across the languages this reviews in practice. Deliberately
+# language-agnostic and deliberately imprecise: over-matching is bounded by the hit
+# ceiling and the budget, whereas a per-language parser would be a dependency.
+DEF_RE = re.compile(
+    r"\b(?:def|class|func|fn|type|interface|struct|"
+    r"function|export\s+(?:const|function|class|type|interface|default)|const|let|var)\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+)
+
+# Names too generic for a grep to say anything useful about.
+SYMBOL_STOPLIST = {
+    "value", "values", "index", "result", "results", "data", "item", "items", "name",
+    "names", "self", "this", "true", "false", "null", "none", "type", "types", "main",
+    "test", "tests", "error", "errors", "config", "options", "params", "args", "kwargs",
+    "string", "number", "object", "array", "list", "dict", "props", "state", "default",
+}
+MIN_SYMBOL_LEN = 4
+MAX_SYMBOLS = 20
+MAX_HITS_PER_SYMBOL = 3
+SYMBOL_HIT_CEILING = 40
+
+
+def changed_symbols(diff: str) -> list[str]:
+    """Definition-shaped identifiers on the diff's added and removed lines.
+
+    These are the names whose call sites a reviewer would grep for. Order is
+    first-seen so the result is deterministic across runs.
+
+    Extraction is skipped entirely for a hunk's added lines when its new path
+    is not code-shaped (and likewise for removed lines against its old path) —
+    `_hunks()` already tracks which file each line belongs to, so this reuses
+    it rather than scanning raw diff text blind to file boundaries. Without
+    that attribution, `DEF_RE`'s `type <name>` alternative fires on ordinary
+    English prose in a markdown diff ("... type explaining the split ..."),
+    which burns slots in the 20-symbol cap on words no grep will ever find.
+    """
+    seen: list[str] = []
+    for new_path, old_path, _old, _new, body in _hunks(diff):
+        added_ok = new_path is not None and _suffix(new_path) in CODE_SUFFIXES
+        removed_ok = old_path is not None and _suffix(old_path) in CODE_SUFFIXES
+        for line in body:
+            if line.startswith("+"):
+                if not added_ok:
+                    continue
+            elif line.startswith("-"):
+                if not removed_ok:
+                    continue
+            else:
+                continue
+            for m in DEF_RE.finditer(line[1:]):
+                name = m.group("name")
+                if len(name) < MIN_SYMBOL_LEN or name.lower() in SYMBOL_STOPLIST:
+                    continue
+                if name not in seen:
+                    seen.append(name)
+    return seen[:MAX_SYMBOLS]
+
+
+def walk_source(root: Path, cfg: dict):
+    """Yield (relpath, text) for every readable, code-shaped text file under `root`.
+
+    Restricted to `CODE_SUFFIXES` so the repo-wide grep searches source, not
+    prose: an unrestricted walk turns every markdown file that happens to
+    mention a changed identifier — a design doc, a kanban board, a changelog —
+    into an indistinguishable "hit" alongside a genuine call site.
+    """
+    ignore = cfg.get("ignore_paths") or []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel.startswith(".git/") or "/.git/" in f"/{rel}":
+            continue
+        if _suffix(rel) not in CODE_SUFFIXES:
+            continue
+        if path_matches(rel, ignore):
+            continue
+        try:
+            if path.stat().st_size > MAX_SOURCE_BYTES:
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if is_binary(data):
+            continue
+        yield rel, data.decode("utf-8", "replace")
+
+
+def grep_repo(
+    root: Path, needles: list[str], cfg: dict, *, exclude: set[str], max_hits: int
+) -> dict[str, list[tuple[str, int, str]]]:
+    """needle -> up to `max_hits` (relpath, lineno, line) matches outside `exclude`.
+
+    A needle exceeding SYMBOL_HIT_CEILING total matches is dropped entirely rather
+    than sampled: a name that appears everywhere tells a reviewer nothing and would
+    crowd out one that appears twice in the file that matters.
+    """
+    if not needles:
+        return {}
+    counts = {n: 0 for n in needles}
+    hits: dict[str, list[tuple[str, int, str]]] = {n: [] for n in needles}
+    for rel, text in walk_source(root, cfg):
+        if rel in exclude:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            for needle in needles:
+                if needle in line:
+                    counts[needle] += 1
+                    if len(hits[needle]) < max_hits:
+                        hits[needle].append((rel, lineno, line.strip()))
+    return {n: h for n, h in hits.items() if h and counts[n] <= SYMBOL_HIT_CEILING}
+
+
+def pack_call_sites(
+    root: Path | None, diff: str, ranges: dict[str, list[tuple[int, int]]],
+    cfg: dict, acc: "Accounting",
+) -> str:
+    """Call sites of changed symbols, and importers of changed modules."""
+    if root is None:
+        return ""
+
+    changed = set(ranges)
+    symbols = changed_symbols(diff)
+    # Importers are cheaper and more precise than symbol matching, so they run even
+    # when nothing definition-shaped changed.
+    #
+    # Iterated over `ranges` itself, not `set(ranges)`: `ranges` is an
+    # insertion-ordered dict, so this is deterministic across runs, while a
+    # set's iteration order depends on CPython's per-process string-hash
+    # randomisation. With more module stems than fit under MAX_SYMBOLS once
+    # combined with `symbols`, which stems survive the cap must not depend on
+    # hash seed — the same diff and checkout must always produce the same
+    # section, or `--save`-based before/after comparisons (see CLAUDE.md) can't
+    # tell a real change from seed noise, and an unchanged PR re-review misses
+    # the prompt cache.
+    modules = []
+    for rel in ranges:
+        stem = _module_stem(rel)
+        if len(stem) >= MIN_SYMBOL_LEN and stem.lower() not in SYMBOL_STOPLIST:
+            modules.append(stem)
+
+    needles = list(dict.fromkeys(symbols + modules))[:MAX_SYMBOLS]
+    found = grep_repo(root, needles, cfg, exclude=changed, max_hits=MAX_HITS_PER_SYMBOL)
+    if not found:
+        return ""
+
+    parts = []
+    for needle, hits in found.items():
+        rendered = "\n".join(f"{rel}:{lineno}: {line}" for rel, lineno, line in hits)
+        parts.append(f"### `{needle}`\n```\n{rendered}\n```\n")
+
+    header = (
+        "## Call sites and importers outside the diff\n\n"
+        "Context only, found by grep over the checkout. Use these to judge whether a "
+        "changed signature, return shape or invariant breaks something the diff does not "
+        "show. Matching is textual, so a hit may be unrelated — read it before relying on "
+        "it, and anchor any finding to the diff line that causes the problem.\n\n"
+    )
+    return acc.add("call_sites", header + "\n".join(parts))
 
 
 def diff_paths(diff: str) -> dict[str, list[tuple[int, int]]]:
