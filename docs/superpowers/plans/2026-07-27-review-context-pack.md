@@ -1762,6 +1762,12 @@ In `review_diff_file()`:
 def run_panel(pr: dict, repo: str, diff: str, ctx: Context, opts: argparse.Namespace) -> dict | None:
 ```
 
+**Also fix its docstring while you are changing the signature.** It currently reads
+"Three lenses in parallel, then adjudication. None if nothing to adjudicate." Task 4 made
+the first clause false — the lenses are staggered, not parallel, whenever caching is on.
+Replace it with wording that says the first lens runs alone to write the cache prefix and
+the rest follow in parallel, and that `None` means there was nothing to adjudicate.
+
 and inside it:
 
 ```python
