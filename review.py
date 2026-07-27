@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import fnmatch
 import json
 import os
 import re
@@ -84,6 +85,7 @@ DEFAULTS = {
     "context": True,
     "max_context_chars": 83000,
     "max_tarball_bytes": 50_000_000,
+    "max_context_files": 25,
 }
 
 VERBOSE = False
@@ -761,6 +763,131 @@ def select(
 # into the prompt deterministically. No model call is involved in any of it.
 # ─────────────────────────────────────────────────────────────────────────────
 
+MAX_SOURCE_BYTES = 512 * 1024  # above this a file is generated or vendored, not reviewable
+BINARY_SNIFF_BYTES = 8 * 1024
+WINDOW_PAD = 60
+
+
+def path_matches(path: str, patterns: list[str]) -> bool:
+    """True if `path` matches any glob in `patterns`.
+
+    `ignore_paths` has been in DEFAULTS since the first commit and read nowhere;
+    this is its first consumer. Patterns are matched against the full path and
+    against the bare filename, so both `*.lock` and `**/generated/**` behave the
+    way someone writing that config would expect.
+    """
+    name = path.rsplit("/", 1)[-1]
+    for pat in patterns:
+        if fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(name, pat):
+            return True
+        # `**/x/**` is the conventional way to write "any directory named x",
+        # which fnmatch has no special handling for.
+        if pat.startswith("**/") and pat.endswith("/**") and f"/{pat.strip('*/')}/" in f"/{path}":
+            return True
+    return False
+
+
+def is_binary(data: bytes) -> bool:
+    return b"\x00" in data[:BINARY_SNIFF_BYTES]
+
+
+def merge_ranges(ranges: list[tuple[int, int]], pad: int) -> list[tuple[int, int]]:
+    """Pad each range by `pad` lines and merge those that now overlap."""
+    padded = sorted((max(1, lo - pad), hi + pad) for lo, hi in ranges)
+    out: list[tuple[int, int]] = []
+    for lo, hi in padded:
+        if out and lo <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], hi))
+        else:
+            out.append((lo, hi))
+    return out
+
+
+def windowed(text: str, ranges: list[tuple[int, int]]) -> str:
+    """Render only `ranges` of `text`, line-numbered, with elisions marked.
+
+    Line numbers matter: without them a lens cannot relate what it reads here to
+    the diff's line numbers. Elisions are stated explicitly so unseen code is
+    visibly unseen rather than silently absent.
+    """
+    lines = text.splitlines()
+    chunks: list[str] = []
+    cursor = 1
+    for lo, hi in ranges:
+        lo, hi = max(1, lo), min(len(lines), hi)
+        if lo > cursor:
+            chunks.append(f"… {lo - cursor} lines elided …")
+        chunks.extend(f"{n}: {lines[n - 1]}" for n in range(lo, hi + 1))
+        cursor = hi + 1
+    if cursor <= len(lines):
+        chunks.append(f"… {len(lines) - cursor + 1} lines elided …")
+    return "\n".join(chunks)
+
+
+def read_source(root: Path | None, gh, repo: str, sha: str, rel: str) -> str | None:
+    """A changed file's text at head, from the checkout or the degraded API path."""
+    if root is not None:
+        p = root / rel
+        try:
+            if not p.is_file() or p.stat().st_size > MAX_SOURCE_BYTES:
+                return None
+            data = p.read_bytes()
+        except OSError:
+            return None
+        return None if is_binary(data) else data.decode("utf-8", "replace")
+    if gh is None:
+        return None
+    try:
+        text = gh.file(repo, rel, ref=sha)
+    except Exception:  # noqa: BLE001 - a file we cannot read degrades the pack only
+        return None
+    if text is None or len(text.encode()) > MAX_SOURCE_BYTES or is_binary(text.encode()[:BINARY_SNIFF_BYTES]):
+        return None
+    return text
+
+
+def pack_changed_files(
+    root: Path | None, gh, repo: str, sha: str,
+    ranges: dict[str, list[tuple[int, int]]], cfg: dict, acc: "Accounting",
+) -> str:
+    """Every changed file at head, whole where it fits and windowed where it does not."""
+    limit = cfg.get("max_context_files", 25)
+    ignore = cfg.get("ignore_paths") or []
+    ordered = sorted(ranges, key=lambda p: (-len(ranges[p]), p))
+    chosen = [p for p in ordered if not path_matches(p, ignore)][:limit]
+    dropped = [p for p in ordered if p not in chosen]
+
+    share = acc.limits["changed_files"]
+    per_file = max(2000, share // max(1, len(chosen)))
+    parts: list[str] = []
+
+    for rel in chosen:
+        text = read_source(root, gh, repo, sha, rel)
+        if text is None:
+            parts.append(f"### {rel}\n(skipped: unreadable, binary, or over {MAX_SOURCE_BYTES} bytes)\n")
+            continue
+        body = text if len(text) <= per_file else windowed(text, merge_ranges(ranges[rel], WINDOW_PAD))
+        if len(body) > per_file:
+            body = windowed(text, ranges[rel])
+        parts.append(f"### {rel}\n```\n{body}\n```\n")
+
+    if dropped:
+        parts.append(
+            f"### {len(dropped)} further changed file(s) not shown\n"
+            + "\n".join(f"- {p}" for p in dropped) + "\n"
+        )
+
+    if not parts:
+        return ""
+    header = (
+        "## Changed files at head\n\n"
+        "Context only. These are the touched files as they stand at the PR head, so you can "
+        "see what each hunk sits inside. A finding still anchors to a diff line, never to a "
+        "line you first saw here.\n\n"
+    )
+    return acc.add("changed_files", header + "\n".join(parts))
+
+
 HUNK_RE = re.compile(r"^@@ -(?P<old>\d+)(?:,(?P<oldc>\d+))? \+(?P<new>\d+)(?:,(?P<newc>\d+))? @@")
 
 
@@ -1062,7 +1189,11 @@ def build_context(
 
         try:
             acc = Accounting(budgets(cfg["max_context_chars"]))
-            # Parts are filled in Tasks 10-13.
+            sections: list[str] = []
+            ranges = diff_paths(diff)
+            sections.append(pack_changed_files(
+                ctx.root, gh, repo, pr["head"]["sha"], ranges, cfg, acc))
+            ctx.pack = "\n".join(s for s in sections if s)
             acc.report()
         except Exception as exc:  # noqa: BLE001 - a bad config must degrade the pack, never the review
             ctx.notes.append(f"context assembly failed ({exc}); pack left empty")
