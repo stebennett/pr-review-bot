@@ -78,5 +78,88 @@ class TestStripFence(unittest.TestCase):
         self.assertEqual(review.strip_fence(payload), payload)
 
 
+DIFF = """\
+diff --git a/src/foo.py b/src/foo.py
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -1,3 +1,4 @@
+ import os
++import sys
+
+ def main():
+"""
+
+PR = {
+    "number": 42,
+    "title": "Add sys import",
+    "body": "Because we need it.",
+    "head": {"sha": "abc1234"},
+    "_rounds": 0,
+    "_prior_body": None,
+}
+
+
+class TestLensPromptBlocks(unittest.TestCase):
+    """Blocks 1 and 2 are the cacheable prefix and must not vary by lens."""
+
+    @classmethod
+    def setUpClass(cls):
+        review.DOC = review.Doctrine(pathlib.Path(review.__file__).resolve().parent / "doctrine")
+
+    def build(self, lens, pack="## Context\nsome context\n"):
+        return review.build_lens_prompt(lens, PR, "o/r", DIFF, "the requirements", pack)
+
+    def test_system_is_one_cached_block(self):
+        system, _ = self.build("craft")
+        self.assertEqual(len(system), 1)
+        self.assertIn("cache_control", system[0])
+
+    def test_user_is_a_cached_block_then_an_uncached_tail(self):
+        _, user = self.build("craft")
+        self.assertEqual(len(user), 2)
+        self.assertIn("cache_control", user[0])
+        self.assertNotIn("cache_control", user[1])
+
+    def test_cacheable_blocks_are_byte_identical_across_lenses(self):
+        built = {lens: self.build(lens) for lens in review.LENSES}
+        systems = {s[0]["text"] for s, _ in built.values()}
+        shared = {u[0]["text"] for _, u in built.values()}
+        self.assertEqual(len(systems), 1, "system block differs between lenses")
+        self.assertEqual(len(shared), 1, "shared user block differs between lenses")
+
+    def test_the_lens_marker_appears_only_in_the_tail(self):
+        for lens in review.LENSES:
+            system, user = self.build(lens)
+            cacheable = system[0]["text"] + user[0]["text"]
+            self.assertNotIn(f"lens: {lens}", cacheable)
+            self.assertIn(f"lens: {lens}", user[1]["text"])
+
+    def test_the_lens_brief_appears_only_in_the_tail(self):
+        for lens in review.LENSES:
+            system, user = self.build(lens)
+            brief = review.DOC(f"lenses/{lens}.md")
+            self.assertNotIn(brief, system[0]["text"] + user[0]["text"])
+            self.assertIn(brief, user[1]["text"])
+
+    def test_shared_doctrine_is_in_the_system_block(self):
+        system, _ = self.build("craft")
+        self.assertIn(review.DOC("lenses/_shared.md"), system[0]["text"])
+        self.assertIn(review.DOC("agents/pr-review-lens.md"), system[0]["text"])
+
+    def test_diff_and_pack_are_in_the_cached_user_block(self):
+        _, user = self.build("craft")
+        self.assertIn(DIFF, user[0]["text"])
+        self.assertIn("some context", user[0]["text"])
+
+    def test_requirements_precede_the_diff(self):
+        _, user = self.build("craft")
+        text = user[0]["text"]
+        self.assertLess(text.index("the requirements"), text.index(DIFF))
+
+    def test_an_absent_pack_leaves_no_dangling_heading(self):
+        _, user = self.build("craft", pack="")
+        self.assertNotIn("## Context", user[0]["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

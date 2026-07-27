@@ -741,28 +741,54 @@ def select(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def run_lens(lens: str, pr: dict, repo: str, diff: str, requirements: str, model: str) -> dict:
-    system = "\n\n".join([
-        DOC("agents/pr-review-lens.md"),
-        DOC("lenses/_shared.md"),
-        DOC(f"lenses/{lens}.md"),
-    ])
-    user = (
-        f"lens: {lens}\n"
+# The deployment-specific tail. Doctrine stays verbatim upstream, so caveats about
+# this deployment live here and in the porting note — see CLAUDE.md.
+LENS_TAIL = (
+    "You have no tools in this deployment. Everything you get to see is in this "
+    "prompt: the diff above is your diff of record, and the context sections that "
+    "follow it — changed files at head, call sites, repo conventions, the path tree — "
+    "are your substitute for a worktree. Read around the diff there.\n\n"
+    "Where a context section is absent, or carries a truncation marker such as "
+    "`… 340 lines elided …`, that is code you have not seen. Do not speculate about "
+    "it. If a finding depends on something you cannot see, either omit it or file it "
+    "as advisory and say in `consequence` that it is unverified.\n\n"
+    "Context informs a finding; it never locates one. Every finding must anchor to a "
+    "`path:line` the diff itself touches — a line you found only by reading the "
+    "context sections is not a valid anchor. Return only the JSON envelope."
+)
+
+
+def build_lens_prompt(
+    lens: str, pr: dict, repo: str, diff: str, requirements: str, pack: str
+) -> tuple[list[dict], list[dict]]:
+    """Three blocks: shared doctrine | shared content | lens-specific tail.
+
+    Blocks 1 and 2 are the cacheable prefix, and they MUST be byte-identical
+    across the three lenses — one lens-dependent character anywhere in them and
+    all three calls miss the cache. That is why the lens name and the lens brief
+    are in block 3 and nowhere else, and why nothing here may be reordered for
+    readability. tests/test_prompting.py enforces it.
+    """
+    doctrine = "\n\n".join([DOC("agents/pr-review-lens.md"), DOC("lenses/_shared.md")])
+    shared = (
         f"pr: {pr['number']}\n"
         f"target_repo: {repo}\n\n"
         f"## PR title\n{pr.get('title', '')}\n\n"
         f"## PR body\n{pr.get('body') or '(empty)'}\n\n"
         f"## Resolved requirements\n{requirements}\n\n"
         f"## Prior recommendations\n{pr.get('_prior_body') or '(none — this is round 1)'}\n\n"
-        f"## Diff (`gh pr diff` canonical rendering)\n```diff\n{diff}\n```\n\n"
-        "You have no worktree and no tools in this deployment: review from the diff "
-        "alone. Where your doctrine tells you to consult the worktree for surrounding "
-        "context, you cannot — so do not speculate about code you cannot see. If a "
-        "finding depends on something outside the diff, either omit it or file it as "
-        "advisory and say in `consequence` that it is unverified. Return only the JSON "
-        "envelope."
+        f"## Diff (`gh pr diff` canonical rendering)\n```diff\n{diff}\n```\n"
     )
+    if pack:
+        shared += f"\n{pack}\n"
+    tail = f"lens: {lens}\n\n{DOC(f'lenses/{lens}.md')}\n\n{LENS_TAIL}"
+    return [seg(doctrine, cache=True)], [seg(shared, cache=True), seg(tail)]
+
+
+def run_lens(
+    lens: str, pr: dict, repo: str, diff: str, requirements: str, pack: str, model: str
+) -> dict:
+    system, user = build_lens_prompt(lens, pr, repo, diff, requirements, pack)
     return openrouter(model, system, user, LENS_SCHEMA, label=f"lens:{lens}")
 
 
@@ -837,7 +863,7 @@ def run_panel(pr: dict, repo: str, diff: str, requirements: str, opts: argparse.
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(lenses)) as pool:
         futures = {
-            pool.submit(run_lens, lens, pr, repo, diff, requirements, opts.model_lens): lens
+            pool.submit(run_lens, lens, pr, repo, diff, requirements, "", opts.model_lens): lens
             for lens in lenses
         }
         envelopes = []
