@@ -738,6 +738,111 @@ def select(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Context pack
+#
+# The lens doctrine (doctrine/lenses/_shared.md, ## Method) tells a lens to read
+# around the diff for "context the hunk alone hides". Upstream that was a worktree
+# plus Read/Grep/Glob; here it is this section, which pushes the same information
+# into the prompt deterministically. No model call is involved in any of it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+HUNK_RE = re.compile(r"^@@ -(?P<old>\d+)(?:,(?P<oldc>\d+))? \+(?P<new>\d+)(?:,(?P<newc>\d+))? @@")
+
+
+def _strip_prefix(target: str) -> str | None:
+    """`a/src/foo.py` -> `src/foo.py`; `/dev/null` -> None."""
+    if target == "/dev/null":
+        return None
+    return target[2:] if target[:2] in ("a/", "b/") else target
+
+
+def _hunks(diff: str) -> list[tuple[str | None, str | None, int, int, list[str]]]:
+    """One (new_path, old_path, old_start, new_start, body) tuple per hunk.
+
+    Both paths are tracked, not just the `+++` one: a deleted file has
+    `+++ /dev/null` and no RIGHT side, but GitHub still accepts a LEFT comment on
+    it, so its `--- a/path` is the only way to anchor there.
+    """
+    out: list[tuple[str | None, str | None, int, int, list[str]]] = []
+    new_path: str | None = None
+    old_path: str | None = None
+    header: re.Match | None = None
+    body: list[str] = []
+
+    def close() -> None:
+        if header is not None:
+            out.append(
+                (new_path, old_path, int(header.group("old")), int(header.group("new")), list(body))
+            )
+
+    for line in diff.splitlines():
+        if line.startswith(("diff --git ", "index ")):
+            continue
+        if line.startswith("--- "):
+            # The `---` line opens a new file, so it also closes the previous
+            # file's last hunk — while old_path/new_path still name that file.
+            close()
+            header, body = None, []
+            old_path = _strip_prefix(line[4:].strip())
+            continue
+        if line.startswith("+++ "):
+            new_path = _strip_prefix(line[4:].strip())
+            continue
+        m = HUNK_RE.match(line)
+        if m:
+            close()
+            header, body = m, []
+            continue
+        if header is not None:
+            body.append(line)
+    close()
+    return out
+
+
+def diff_paths(diff: str) -> dict[str, list[tuple[int, int]]]:
+    """path -> RIGHT-side (start, end) inclusive line ranges the diff touches.
+
+    Deleted files are absent: there is no head-side file to read for them.
+    """
+    out: dict[str, list[tuple[int, int]]] = {}
+    for new_path, _old_path, _old, new, body in _hunks(diff):
+        if new_path is None:
+            continue
+        span = sum(1 for ln in body if not ln.startswith("-"))
+        if span:
+            out.setdefault(new_path, []).append((new, new + span - 1))
+    return out
+
+
+def diff_anchors(diff: str) -> set[tuple[str, int, str]]:
+    """(path, line, side) triples GitHub will accept as an inline comment anchor.
+
+    A comment on a line the diff does not touch makes GitHub reject the ENTIRE
+    review with a 422, which is why this exists — see post_review's fallback.
+    """
+    anchors: set[tuple[str, int, str]] = set()
+    for new_path, old_path, old, new, body in _hunks(diff):
+        old_n, new_n = old, new
+        for line in body:
+            if line.startswith("+"):
+                if new_path:
+                    anchors.add((new_path, new_n, "RIGHT"))
+                new_n += 1
+            elif line.startswith("-"):
+                if old_path:
+                    anchors.add((old_path, old_n, "LEFT"))
+                old_n += 1
+            else:
+                if new_path:
+                    anchors.add((new_path, new_n, "RIGHT"))
+                if old_path:
+                    anchors.add((old_path, old_n, "LEFT"))
+                old_n += 1
+                new_n += 1
+    return anchors
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # The pass
 # ─────────────────────────────────────────────────────────────────────────────
 
