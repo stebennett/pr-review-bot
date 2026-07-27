@@ -846,6 +846,13 @@ def read_source(root: Path | None, gh, repo: str, sha: str, rel: str) -> str | N
     return text
 
 
+def _whole_file_body(rel: str, text: str) -> str:
+    """`rel` rendered in full — still through `windowed()`, so it is numbered
+    exactly like a windowed file rather than being a visually distinct shape."""
+    lines = text.splitlines()
+    return f"### {rel}\n```\n{windowed(text, [(1, len(lines))])}\n```\n"
+
+
 def _render_changed_file(rel: str, text: str, file_ranges: list[tuple[int, int]], cap: int) -> str:
     """One file's rendered section, shrunk in stages to fit `cap` characters.
 
@@ -857,16 +864,88 @@ def _render_changed_file(rel: str, text: str, file_ranges: list[tuple[int, int]]
     never against bare content, because the wrapper is real overhead a lens
     pays for too.
     """
-    lines = text.splitlines()
-    for candidate_ranges in (
-        [(1, len(lines))],
-        merge_ranges(file_ranges, WINDOW_PAD),
-        file_ranges,
-    ):
+    whole = _whole_file_body(rel, text)
+    if len(whole) <= cap:
+        return whole
+    for candidate_ranges in (merge_ranges(file_ranges, WINDOW_PAD), file_ranges):
         body = f"### {rel}\n```\n{windowed(text, candidate_ranges)}\n```\n"
         if len(body) <= cap:
             return body
     return body  # even the tightest window does not fit; caller decides whether to keep it
+
+
+def _water_fill(needs: dict[str, int], floors: dict[str, int], budget: int) -> dict[str, int]:
+    """Per-key shares of `budget`: a key needing less than an equal share
+    keeps only what it needs, releasing the remainder to the keys still
+    competing for room. Repeats until the allocation is stable, rather than
+    handing every key the same pessimistic equal-division share regardless of
+    how little most of them actually need — which is what let a large-but-
+    fittable file get squeezed into windowing it never needed, while the
+    budget its neighbours didn't use went unspent.
+
+    `floors[k]` is the smallest `k` can ever be rendered to (its tightest,
+    unpadded window) — for a file whose diff touches most or all of its own
+    body, that floor equals its whole-file need: no allocation, however
+    generous, will let it shrink further. When a round can satisfy no one
+    outright, such a key is excluded from that round's division rather than
+    joining the equal share: it could never make productive use of a share
+    that size anyway, and counting it in the divisor would only depress the
+    share computed for keys that genuinely could use it. It is folded back in
+    — at whatever is left, usually not enough — once every key that actually
+    can be satisfied has been.
+    """
+    caps: dict[str, int] = {}
+    pending = list(needs)
+    deferred: list[str] = []
+    remaining = max(0, budget)
+    while pending:
+        share = remaining // len(pending)
+        satisfied = [k for k in pending if needs[k] <= share]
+        if satisfied:
+            for k in satisfied:
+                caps[k] = needs[k]
+                remaining -= needs[k]
+            pending = [k for k in pending if k not in caps]
+            continue
+        hopeless = [k for k in pending if floors[k] > share]
+        if hopeless and len(hopeless) < len(pending):
+            deferred.extend(hopeless)
+            pending = [k for k in pending if k not in hopeless]
+            continue
+        # Either everyone left here could still make some use of an equal
+        # share (shrinkable, just not down to its full need), or every one of
+        # them is equally hopeless and no smaller grouping would change that
+        # — either way, the equal share is this round's stable allocation.
+        for k in pending:
+            caps[k] = share
+        pending = []
+    for k in deferred:
+        caps.setdefault(k, 0)
+    return caps
+
+
+def _trailer_groups(
+    ignored: list[str], cap_dropped: list[str], budget_dropped: list[str], *, with_names: bool
+) -> list[str]:
+    """The up-to-three labelled "not shown" groups, only the non-empty ones.
+
+    `with_names=False` renders just the counts, no per-path bullet list — the
+    fallback when even the full trailer cannot fit the budget on its own.
+    """
+    def group(items: list[str], label: str) -> str | None:
+        if not items:
+            return None
+        text = f"### {len(items)} {label}\n"
+        if with_names:
+            text += "\n".join(f"- {p}" for p in items) + "\n"
+        return text
+
+    groups = [
+        group(ignored, "file(s) excluded by ignore_paths"),
+        group(cap_dropped, "further changed file(s) not shown (file cap)"),
+        group(budget_dropped, "further changed file(s) not shown (budget)"),
+    ]
+    return [g for g in groups if g is not None]
 
 
 def pack_changed_files(
@@ -875,16 +954,24 @@ def pack_changed_files(
 ) -> str:
     """Every changed file at head, whole where it fits and windowed where it does not.
 
-    Assembly is greedy, self-limiting, and skip-not-stop: each file's cap is
-    recomputed from whatever budget the files ahead of it left behind, the
-    fit decision is made on the actual rendered (wrapped, windowed) string —
-    never on raw file size — and a file that does not fit even at its
-    tightest windowing is skipped, not treated as end-of-budget. A large
-    file sorting ahead of a small one must not cost the small one its place:
-    the small file gets its own chance at whatever room remains. Nothing is
-    ever handed to `Accounting` in a state that could still overrun, because
-    `acc.add` truncating this section at a raw offset would cut a file body
-    in half, which is worse than dropping the file cleanly and naming it.
+    Sized in two passes. First, every chosen file's whole-file cost is
+    measured; if all of them together fit the budget, they are all emitted
+    whole and no windowing happens at all — the common case for an ordinary
+    pull request. Otherwise the budget is water-filled across those costs
+    (`_water_fill`): a file that needs less than an equal share keeps only
+    what it needs, so a handful of small files no longer force a large-but-
+    fittable file into windowing it never needed — and a file that could
+    never usefully shrink to any share this small (its floor already exceeds
+    it — typically because its diff touches nearly all of its own body) is
+    excluded from that round's division rather than depressing the share
+    computed for files that genuinely could use it. A file whose windowed
+    form still cannot fit what remains is skipped, not stopped on — a smaller
+    file later in priority order still gets its own chance at the room a
+    bigger one could not use. Nothing is ever handed to `Accounting` in a
+    state that could still overrun: `acc.add` truncating this section at a
+    raw offset would cut a file body in half, which is worse than dropping
+    the file cleanly and naming it, and the trailer itself is sized to fit
+    before it is ever attached.
     """
     if not ranges:
         return ""
@@ -904,64 +991,83 @@ def pack_changed_files(
         "line you first saw here.\n\n"
     )
     budget = acc.limits["changed_files"]
-    remaining = max(0, budget - len(header))
+    available = max(0, budget - len(header))
+
+    # Pass 1: read each chosen file once, and measure both what it would cost
+    # rendered whole and its floor — the tightest it could ever be windowed
+    # to. For a file whose diff touches nearly all of its own body the two
+    # are equal: there is no smaller form, and `_water_fill` needs to know
+    # that. A file that cannot be read has a fixed placeholder for both —
+    # there is nothing to window for that one.
+    texts: dict[str, str | None] = {}
+    whole_bodies: dict[str, str] = {}
+    needs: dict[str, int] = {}
+    floors: dict[str, int] = {}
+    for rel in chosen:
+        text = read_source(root, gh, repo, sha, rel)
+        texts[rel] = text
+        if text is None:
+            body = f"### {rel}\n(skipped: unreadable, binary, or over {MAX_SOURCE_BYTES} bytes)\n"
+            floors[rel] = len(body)
+        else:
+            body = _whole_file_body(rel, text)
+            floors[rel] = len(f"### {rel}\n```\n{windowed(text, ranges[rel])}\n```\n")
+        whole_bodies[rel] = body
+        needs[rel] = len(body)
 
     shown_files: list[str] = []
     shown_parts: list[str] = []
     budget_dropped: list[str] = []
-    pending = list(chosen)
-    while pending:
-        if remaining <= 0:
-            # Nothing left to spend and every body costs at least a few
-            # characters of wrapper, so every remaining file is unfittable —
-            # stopping here is a real end-of-budget, not the priority-order
-            # stop this task removed.
-            budget_dropped.extend(pending)
-            break
-        rel = pending.pop(0)
-        cap = max(0, remaining // (len(pending) + 1))
-        text = read_source(root, gh, repo, sha, rel)
-        if text is None:
-            body = f"### {rel}\n(skipped: unreadable, binary, or over {MAX_SOURCE_BYTES} bytes)\n"
-        else:
-            body = _render_changed_file(rel, text, ranges[rel], cap)
-        if len(body) <= remaining:
-            shown_files.append(rel)
-            shown_parts.append(body)
-            remaining -= len(body)
-        else:
-            # Even this file's tightest windowing does not fit what is left.
-            # Skip it and keep going — a smaller file later in priority order
-            # may still fit the room this one could not, and must get the
-            # chance regardless of what sorted ahead of it.
-            budget_dropped.append(rel)
+
+    if sum(needs.values()) <= available:
+        # Everything fits whole. No windowing decision needed at all — this
+        # is the ordinary pull request, and it should read as one.
+        shown_files, shown_parts = list(chosen), [whole_bodies[rel] for rel in chosen]
+        remaining = available - sum(needs.values())
+    else:
+        caps = _water_fill(needs, floors, available)
+        remaining = available
+        for rel in chosen:
+            if remaining <= 0:
+                # Nothing left to spend and every body costs at least a few
+                # characters of wrapper, so every remaining file is
+                # unfittable — a real end-of-budget, not a priority-order stop.
+                budget_dropped.append(rel)
+                continue
+            text = texts[rel]
+            cap = max(0, min(caps[rel], remaining))
+            body = whole_bodies[rel] if text is None else _render_changed_file(rel, text, ranges[rel], cap)
+            if len(body) <= remaining:
+                shown_files.append(rel)
+                shown_parts.append(body)
+                remaining -= len(body)
+            else:
+                # Even this file's tightest windowing does not fit what is
+                # left. Skip it and keep going — a smaller file later in
+                # priority order may still fit the room this one could not,
+                # and must get the chance regardless of what sorted ahead of it.
+                budget_dropped.append(rel)
 
     # The trailer itself costs characters. If it pushes the total over budget,
-    # give back the lowest-priority shown file (which is worth far more than
-    # one more line in a drop-list) and recompute, rather than ever handing
-    # Accounting an over-budget string to slice.
-    while True:
-        groups: list[str] = []
-        if ignored:
-            groups.append(
-                f"### {len(ignored)} file(s) excluded by ignore_paths\n"
-                + "\n".join(f"- {p}" for p in ignored) + "\n"
-            )
-        if cap_dropped:
-            groups.append(
-                f"### {len(cap_dropped)} further changed file(s) not shown (file cap)\n"
-                + "\n".join(f"- {p}" for p in cap_dropped) + "\n"
-            )
-        if budget_dropped:
-            groups.append(
-                f"### {len(budget_dropped)} further changed file(s) not shown (budget)\n"
-                + "\n".join(f"- {p}" for p in budget_dropped) + "\n"
-            )
-        assembled = header + "\n".join(shown_parts + groups)
-        if len(assembled) <= budget or not shown_parts:
+    # give back the lowest-priority shown file (worth far more than one more
+    # line in a drop-list) and recompute. Once there are no more shown files
+    # to give back, fall through to a names-free trailer, then the bare
+    # header, then nothing — each strictly smaller — so the section can never
+    # be handed to Accounting in a state it would have to slice mid-line.
+    assembled = header
+    for with_names in (True, False):
+        groups = _trailer_groups(ignored, cap_dropped, budget_dropped, with_names=with_names)
+        while True:
+            assembled = header + "\n".join(shown_parts + groups)
+            if len(assembled) <= budget or not shown_parts:
+                break
+            budget_dropped = [shown_files.pop()] + budget_dropped
+            shown_parts.pop()
+            groups = _trailer_groups(ignored, cap_dropped, budget_dropped, with_names=with_names)
+        if len(assembled) <= budget:
             break
-        budget_dropped = [shown_files.pop()] + budget_dropped
-        shown_parts.pop()
+    if len(assembled) > budget:
+        assembled = header if len(header) <= budget else ""
 
     if not shown_parts and not ignored and not cap_dropped and not budget_dropped:
         return ""

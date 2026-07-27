@@ -517,6 +517,86 @@ class TestPackChangedFiles(unittest.TestCase):
         self.assertLessEqual(len(out), acc.limits["changed_files"])
         self.assertNotIn("changed_files", acc.truncated)
 
+    def test_utilisation_on_a_realistic_shape_stays_high_with_only_the_oversized_file_dropped(self):
+        # Round 3 regression: mirrors the real PR's actual shape — several
+        # medium files whose diffs touch only PART of a larger file (so they
+        # window down usefully but easily fit whole given real headroom) plus
+        # one file whose diff touches its ENTIRE body (so no window can ever
+        # shrink it). Equal-division water-filling (round 2) let this one
+        # unshrinkable outlier drag the shared "average" below what the
+        # medium files actually needed, windowing them down needlessly even
+        # though the budget to show them whole existed. The fix must exclude
+        # a file that can never usefully shrink from that division.
+        medium_specs = {
+            "medium1.py": (200, (100, 105)),
+            "medium2.py": (300, (140, 150)),
+            "medium3.py": (150, (60, 65)),
+        }
+        files = {}
+        ranges = {}
+        for name, (n_lines, hunk) in medium_specs.items():
+            files[name] = "\n".join(f"line{i}" for i in range(1, n_lines + 1)) + "\n"
+            ranges[name] = [hunk]
+        unfittable_lines = 3000
+        files["unfittable.py"] = "\n".join(f"line{i}" for i in range(1, unfittable_lines + 1)) + "\n"
+        ranges["unfittable.py"] = [(1, unfittable_lines)]  # touches the entire file
+        make_tree(self.root, files)
+
+        # Computed independently of pack_changed_files's own internals: each
+        # whole file, numbered "N: lineN" one per line, wrapped in the same
+        # "### name" + fence shape the section itself uses.
+        def whole_size(name: str, n_lines: int) -> int:
+            body = "\n".join(f"{i}: line{i}" for i in range(1, n_lines + 1))
+            return len(f"### {name}\n```\n{body}\n```\n")
+
+        medium_wholes = sum(whole_size(name, spec[0]) for name, spec in medium_specs.items())
+        acc = self.acc(limit=medium_wholes + 400)  # just enough headroom for the mediums, not the outlier
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+
+        for name in medium_specs:
+            self.assertIn(f"### {name}", out)
+        self.assertIn("### 1 further changed file(s) not shown (budget)\n- unfittable.py", out)
+        self.assertNotIn("elided", out)  # the mediums must be shown WHOLE, not windowed
+        self.assertGreaterEqual(acc.used["changed_files"], 0.90 * acc.limits["changed_files"])
+        self.assertLessEqual(len(out), acc.limits["changed_files"])
+        self.assertNotIn("changed_files", acc.truncated)
+
+    def test_files_that_collectively_fit_whole_are_never_windowed(self):
+        # Direct guard for Finding 6: when the budget comfortably covers every
+        # chosen file rendered whole, none of them should be windowed at all
+        # — not even the largest of the bunch.
+        files = {
+            f"src/f{i}.py": "\n".join(f"line{i}_{j}" for j in range(1, 21)) + "\n"
+            for i in range(5)
+        }
+        make_tree(self.root, files)
+        ranges = {p: [(5, 8)] for p in files}
+        acc = self.acc()  # generous default budget
+        out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, self.cfg, acc)
+        for p in files:
+            self.assertIn(f"### {p}", out)
+        self.assertNotIn("elided", out)
+        self.assertNotIn("not shown", out)
+        self.assertLessEqual(len(out), acc.limits["changed_files"])
+        self.assertNotIn("changed_files", acc.truncated)
+
+    def test_a_tiny_budget_with_a_long_dropped_file_list_does_not_truncate(self):
+        # Folded-in Minor: the trailer-shrink loop used to exit unconditionally
+        # once shown_parts was empty, even if header + trailer alone still
+        # exceeded budget — which could let Accounting truncate the section
+        # outright, breaking the no-overrun contract at the very budgets where
+        # it matters most.
+        files = {f"src/f{i}.py": f"body{i}\n" for i in range(30)}
+        make_tree(self.root, files)
+        ranges = {p: [(1, 1)] for p in files}
+        cfg = dict(self.cfg, max_context_files=0)  # everything lands in one long drop list
+        for limit in (0, 1, 50, 300, 1000):
+            with self.subTest(limit=limit):
+                acc = self.acc(limit=limit)
+                out = review.pack_changed_files(self.root, None, "o/r", "sha", ranges, cfg, acc)
+                self.assertLessEqual(len(out), acc.limits["changed_files"])
+                self.assertNotIn("changed_files", acc.truncated)
+
 
 if __name__ == "__main__":
     unittest.main()
