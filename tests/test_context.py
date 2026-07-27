@@ -1237,12 +1237,13 @@ class TestPackConventions(unittest.TestCase):
         self.assertEqual(self._headers(out), ["CONTRIBUTING.md"])
         self.assertNotIn("Readme text.", out)
 
-    def test_multi_level_ancestors_are_collected_nearest_first_per_branch(self):
+    def test_multi_level_ancestors_are_collected_deepest_first_root_last(self):
         # Real depth: a root file, a mid-level file, and a file right next to
-        # the change, all three distinct so order is unambiguous. Nearest to
-        # the changed file (web/app/deep/mod.py) is web/app/CONTRIBUTING.md,
-        # then web/AGENTS.md, then the root CLAUDE.md (always considered,
-        # since dirs always includes "" alongside every changed directory).
+        # the change, all three distinct so order is unambiguous. Ordered by
+        # descending directory depth: web/app/CONTRIBUTING.md (depth 2) before
+        # web/AGENTS.md (depth 1) before the root CLAUDE.md (depth 0) — nearest
+        # to the change first, root last, so truncation sacrifices the root
+        # file rather than the nearest one.
         make_tree(self.root, {
             "CLAUDE.md": "Root CLAUDE conventions.\n",
             "web/AGENTS.md": "Web AGENTS conventions.\n",
@@ -1251,11 +1252,29 @@ class TestPackConventions(unittest.TestCase):
         out = review.pack_conventions(self.root, {"web/app/deep/mod.py": [(1, 1)]}, self.acc())
         self.assertEqual(
             self._headers(out),
-            ["CLAUDE.md", "web/app/CONTRIBUTING.md", "web/AGENTS.md"],
+            ["web/app/CONTRIBUTING.md", "web/AGENTS.md", "CLAUDE.md"],
         )
         self.assertIn("Root CLAUDE conventions.", out)
         self.assertIn("App CONTRIBUTING conventions.", out)
         self.assertIn("Web AGENTS conventions.", out)
+
+    def test_two_touched_branches_at_different_depths_are_ordered_by_depth_then_path(self):
+        # Two independently touched branches, each with its own convention
+        # file at a different depth, plus the always-considered root. The
+        # chosen rule (descending depth, ties broken by path) must produce
+        # exactly this order regardless of which branch happens to sort
+        # first alphabetically or get built first as a set/dict.
+        make_tree(self.root, {
+            "CLAUDE.md": "Root rules.\n",
+            "api/AGENTS.md": "Api rules.\n",
+            "web/app/CONTRIBUTING.md": "Web app rules.\n",
+        })
+        ranges = {"api/handler.py": [(1, 1)], "web/app/deep/mod.py": [(1, 1)]}
+        out = review.pack_conventions(self.root, ranges, self.acc())
+        self.assertEqual(
+            self._headers(out),
+            ["web/app/CONTRIBUTING.md", "api/AGENTS.md", "CLAUDE.md"],
+        )
 
     def test_a_shared_ancestor_file_is_not_duplicated_across_changed_files(self):
         make_tree(self.root, {"src/CLAUDE.md": "Src rules.\n"})
@@ -1283,6 +1302,25 @@ class TestPackConventions(unittest.TestCase):
         self.assertIn("nearnearnear" * 590, out)
         self.assertNotIn("farfarfar", out)
 
+    def test_a_root_file_is_the_one_sacrificed_when_a_nearer_file_also_exists(self):
+        # The exact combination the inverted-order bug missed: a root
+        # convention file *and* a nearer one, budget swept across several
+        # tight values so the assertion does not hinge on one lucky
+        # threshold. At every one of these budgets only one file's content
+        # can fit — it must always be the nearest (web/AGENTS.md), never the
+        # root (CLAUDE.md).
+        make_tree(self.root, {
+            "CLAUDE.md": "rootrootroot" * 600 + "\n",
+            "web/AGENTS.md": "nearnearnear" * 600 + "\n",
+        })
+        ranges = {"web/app/x.py": [(1, 1)]}
+        for budget in (4400, 4200, 4000):
+            with self.subTest(budget=budget):
+                out = review.pack_conventions(self.root, ranges, self.acc(conventions=budget))
+                self.assertIn("truncated", out)
+                self.assertIn("nearnearnear", out)
+                self.assertNotIn("rootrootroot", out)
+
     def test_no_convention_files_and_no_readme_yields_an_empty_section(self):
         make_tree(self.root, {"src/a.py": "x = 1\n"})
         out = review.pack_conventions(self.root, {"src/a.py": [(1, 1)]}, self.acc())
@@ -1290,6 +1328,45 @@ class TestPackConventions(unittest.TestCase):
 
     def test_no_checkout_yields_an_empty_section(self):
         self.assertEqual(review.pack_conventions(None, {}, self.acc()), "")
+
+    def test_the_emitted_order_is_identical_across_python_hash_seeds(self):
+        # The direct regression guard for this bug's root cause: `own_dirs`
+        # and `prefixes` are sets, so without a final deterministic sort key
+        # the surviving order (and therefore what a tight budget keeps or
+        # drops) could depend on CPython's per-process string-hash
+        # randomisation. Six branches at three different depths is wide
+        # enough that a hash-seed-dependent order would actually show up as
+        # a different result, not just a coincidentally-stable one.
+        files = {"CLAUDE.md": "root\n"}
+        ranges = {}
+        for i in range(6):
+            d = f"team{i:02d}/svc{i:02d}/deep{i:02d}"
+            files[f"{d}/AGENTS.md"] = f"rules {i}\n"
+            ranges[f"{d}/mod.py"] = [(1, 1)]
+        make_tree(self.root, files)
+
+        review_dir = str(pathlib.Path(review.__file__).resolve().parent)
+        script = (
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {review_dir!r})\n"
+            "import review\n"
+            f"ranges = {ranges!r}\n"
+            "acc = review.Accounting({'changed_files': 1, 'call_sites': 1,\n"
+            "                         'conventions': 100000, 'requirements': 1, 'tree': 1})\n"
+            f"out = review.pack_conventions(pathlib.Path({str(self.root)!r}), ranges, acc)\n"
+            "sys.stdout.write(out)\n"
+        )
+        outputs = []
+        for seed in ("0", "1", "42"):
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True, text=True, check=True,
+            )
+            outputs.append(proc.stdout)
+        self.assertTrue(outputs[0], "the fixture produced nothing; it proves nothing")
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0], outputs[2])
 
 
 class TestPackTree(unittest.TestCase):

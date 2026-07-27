@@ -1389,10 +1389,17 @@ TREE_KEEP_DEPTH = 2
 def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]], acc: "Accounting") -> str:
     """The conventions documents governing the changed directories.
 
-    Walks from each changed file's own directory up to the repo root, nearest
-    first, collecting every `CONVENTION_FILES` match at each level — this is
-    what lets a nested `web/AGENTS.md` say something a root `CLAUDE.md` does
-    not, and lets both apply at once to a file two levels under `web/`.
+    Collects every `CONVENTION_FILES` match from each changed file's own
+    directory up to the repo root, across every touched branch, then orders
+    the result by descending directory depth — deepest (nearest to a change)
+    first, root last — breaking ties on the prefix string for determinism.
+    `Accounting.add` truncates from the tail, so this ordering is what
+    guarantees a budget squeeze sacrifices the least specific guidance (the
+    root file) rather than the most specific one (a nested `web/AGENTS.md`).
+    Sorting on a tuple key rather than relying on insertion order also means
+    the result cannot depend on set/dict iteration order, which is otherwise
+    seeded per-process and would make the pack non-deterministic across runs.
+
     README is added only when nothing in `CONVENTION_FILES` was found
     anywhere: it is usually description rather than instruction, and is often
     long enough on its own to crowd out the real thing under the budget.
@@ -1400,16 +1407,26 @@ def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]]
     if root is None:
         return ""
 
-    wanted: list[str] = []
-    dirs = {""} | {rel.rsplit("/", 1)[0] for rel in ranges if "/" in rel}
-    for d in sorted(dirs):
+    # Every directory a changed file lives directly in ("" for one at the
+    # repo root), unioned with every ancestor of each up to "" itself — the
+    # full set of prefixes worth checking for a convention file, for every
+    # touched branch at once.
+    own_dirs = {rel.rsplit("/", 1)[0] if "/" in rel else "" for rel in ranges} or {""}
+    prefixes: set[str] = {""}
+    for d in own_dirs:
         parts = d.split("/") if d else []
         for depth in range(len(parts), -1, -1):
-            prefix = "/".join(parts[:depth])
-            for name in CONVENTION_FILES:
-                rel = f"{prefix}/{name}" if prefix else name
-                if (root / rel).is_file() and rel not in wanted:
-                    wanted.append(rel)
+            prefixes.add("/".join(parts[:depth]))
+
+    def depth_of(prefix: str) -> int:
+        return 0 if not prefix else prefix.count("/") + 1
+
+    wanted: list[str] = []
+    for prefix in sorted(prefixes, key=lambda p: (-depth_of(p), p)):
+        for name in CONVENTION_FILES:
+            rel = f"{prefix}/{name}" if prefix else name
+            if (root / rel).is_file() and rel not in wanted:
+                wanted.append(rel)
 
     if not wanted and (root / "README.md").is_file():
         wanted.append("README.md")
