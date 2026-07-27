@@ -129,7 +129,10 @@ Pure plumbing. `openrouter` currently takes `system` and `user` as strings and b
   - `CACHE_ENABLED: bool` module global, default `True`
   - `seg(text: str, *, cache: bool = False) -> dict`
   - `completion_payload(model: str, system: str | list[dict], user: str | list[dict], schema: dict, label: str) -> dict`
+  - `strip_fence(text: str) -> str`
   - `openrouter(model, system, user, schema, *, label)` with `system`/`user` widened to `str | list[dict]`
+
+**In-scope bug fix, ruled before execution.** Capturing the Task 1 baseline exposed a pre-existing bug in this exact function: a provider returned a valid JSON object wrapped in a ```` ```json ```` fence, `json.loads` rejected it, and the retry ladder paid for a whole extra generation. `provider: {"require_parameters": True}` did not prevent it — a provider can honour `response_format` and still fence its output. Since this task is already rewriting `openrouter`'s payload construction and response handling, the fix belongs here.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -190,6 +193,30 @@ class TestCompletionPayload(unittest.TestCase):
         self.assertEqual(p["temperature"], 0)
         self.assertTrue(p["provider"]["require_parameters"])
         self.assertTrue(p["response_format"]["json_schema"]["strict"])
+
+
+class TestStripFence(unittest.TestCase):
+    """A provider can honour response_format and still fence its output."""
+
+    def test_bare_json_is_returned_unchanged(self):
+        self.assertEqual(review.strip_fence('{"a": 1}'), '{"a": 1}')
+
+    def test_a_labelled_fence_is_removed(self):
+        self.assertEqual(review.strip_fence('```json\n{"a": 1}\n```'), '{"a": 1}')
+
+    def test_an_unlabelled_fence_is_removed(self):
+        self.assertEqual(review.strip_fence('```\n{"a": 1}\n```'), '{"a": 1}')
+
+    def test_an_unterminated_fence_is_still_stripped(self):
+        self.assertEqual(review.strip_fence('```json\n{"a": 1}'), '{"a": 1}')
+
+    def test_surrounding_whitespace_is_removed(self):
+        self.assertEqual(review.strip_fence('\n\n```json\n{"a": 1}\n```\n\n'), '{"a": 1}')
+
+    def test_a_fence_inside_a_string_value_survives(self):
+        # Only the outermost wrapper is stripped; lens findings quote code.
+        payload = '{"fix": "use ```python blocks"}'
+        self.assertEqual(review.strip_fence(payload), payload)
 
 
 if __name__ == "__main__":
@@ -260,6 +287,27 @@ def completion_payload(
         # every parameter we send.
         "provider": {"require_parameters": True},
     }
+
+
+def strip_fence(text: str) -> str:
+    """Unwrap a markdown fence a provider wrapped its JSON object in.
+
+    `require_parameters` is meant to route only to providers that honour
+    `response_format`, and mostly it does — but a provider can honour it and
+    still emit a fenced object anyway. Without this, json.loads fails and the
+    retry ladder pays for an entire extra generation to fail the same way.
+    Observed in the Task 1 baseline run, not defensive programming.
+
+    Only an outermost wrapper is removed: a lens finding legitimately quotes
+    fenced code inside a string value, and that must survive untouched.
+    """
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    t = t.split("\n", 1)[1] if "\n" in t else t[3:]
+    if t.rstrip().endswith("```"):
+        t = t.rstrip()[:-3]
+    return t.strip()
 ```
 
 - [ ] **Step 4: Rewrite `openrouter` to use it, and widen its signature**
@@ -292,6 +340,16 @@ The `approx_tokens` line counts characters and must handle blocks now:
     approx_tokens = (len(_text(system)) + len(_text(user))) // 4
 ```
 
+In the same function, the parse of the response content becomes fence-tolerant. Find `return json.loads(content)` and replace it with:
+
+```python
+            try:
+                return json.loads(strip_fence(content))
+            except json.JSONDecodeError as exc:
+```
+
+Leave the `except` block's message intact — it is still the right diagnostic for a provider that returned genuine prose rather than a fenced object.
+
 - [ ] **Step 5: Add cached-token logging**
 
 The spec makes this a requirement, not a diagnostic: a silent cache miss costs the 1.25x write premium for nothing, and this line is the only way to see it. Replace the existing response log in `openrouter()`:
@@ -316,7 +374,7 @@ The spec makes this a requirement, not a diagnostic: a silent cache miss costs t
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: 7 tests, all PASS.
+Expected: all PASS (13 tests).
 
 - [ ] **Step 7: Verify the offline path still works and output is unchanged**
 
@@ -532,7 +590,7 @@ The pack does not exist until Task 9. In `run_panel`, the `pool.submit` call bec
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: 16 tests, all PASS.
+Expected: all PASS (22 tests).
 
 - [ ] **Step 8: Verify the full offline path runs**
 
@@ -695,7 +753,7 @@ Replace the `with concurrent.futures.ThreadPoolExecutor(...)` block in `run_pane
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: 22 tests, all PASS.
+Expected: all PASS (28 tests).
 
 - [ ] **Step 6: Verify staggering on a real run and read the cache numbers**
 
@@ -1133,7 +1191,7 @@ Note: `_hunks` uses `yield from flush()` where `flush` is itself a generator, so
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: 33 tests, all PASS. If `test_right_side_ranges_cover_the_hunk` fails, check that removed lines are excluded from the span — a `-` line consumes no RIGHT-side line number.
+Expected: all PASS (39 tests). If `test_right_side_ranges_cover_the_hunk` fails, check that removed lines are excluded from the span — a `-` line consumes no RIGHT-side line number.
 
 - [ ] **Step 5: Sanity-check against the real diff**
 
@@ -1273,7 +1331,7 @@ After the envelopes are collected and before adjudication:
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: 39 tests, all PASS.
+Expected: all PASS (45 tests).
 
 - [ ] **Step 6: Establish the pre-pack violation baseline**
 
@@ -1739,7 +1797,7 @@ In `build_parser()`:
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: all PASS (52 tests — the count is indicative, the pass is not).
+Expected: all PASS (58 tests — the count is indicative, the pass is not).
 
 - [ ] **Step 10: Verify the plumbing end to end**
 
@@ -2074,7 +2132,7 @@ In `build_context`, replacing the `# Parts are filled in Tasks 10-13.` comment:
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: all PASS (73 tests).
+Expected: all PASS (79 tests).
 
 - [ ] **Step 7: Inspect a real pack**
 
@@ -2410,7 +2468,7 @@ def pack_call_sites(
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: all PASS (91 tests).
+Expected: all PASS (97 tests).
 
 - [ ] **Step 8: Inspect real call sites**
 
@@ -2623,7 +2681,7 @@ def pack_tree(root: Path | None, ranges: dict, cfg: dict, acc: Accounting) -> st
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: all PASS (100 tests).
+Expected: all PASS (106 tests).
 
 - [ ] **Step 6: Inspect the real sections**
 
@@ -2874,7 +2932,7 @@ Requirements are resolved before the other parts, because `Accounting` must reco
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Expected: all PASS (115 tests).
+Expected: all PASS (121 tests).
 
 - [ ] **Step 7: Verify against a real PR with a linked issue**
 
