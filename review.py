@@ -42,11 +42,13 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +81,9 @@ DEFAULTS = {
     "max_review_lines": 3000,
     "ignore_paths": ["*.lock", "package-lock.json", "**/generated/**"],
     "cache": True,
+    "context": True,
+    "max_context_chars": 83000,
+    "max_tarball_bytes": 50_000_000,
 }
 
 VERBOSE = False
@@ -288,15 +293,25 @@ class GitHub:
         h = dict(self._h, Accept="application/vnd.github.v3.diff")
         return _http("GET", f"{GITHUB_API}/repos/{repo}/pulls/{number}", headers=h)
 
-    def file(self, repo: str, path: str) -> str | None:
+    def file(self, repo: str, path: str, ref: str | None = None) -> str | None:
         """Fetch a file's contents, or None if it does not exist."""
         h = dict(self._h, Accept="application/vnd.github.v3.raw")
+        url = f"{GITHUB_API}/repos/{repo}/contents/{path}"
+        if ref:
+            url += f"?ref={ref}"
         try:
-            return _http("GET", f"{GITHUB_API}/repos/{repo}/contents/{path}", headers=h, raw=True)
+            return _http("GET", url, headers=h, raw=True)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return None
             raise
+
+    def open_tarball(self, repo: str, sha: str):
+        """An open response streaming the repo tarball at `sha`."""
+        req = urllib.request.Request(
+            f"{GITHUB_API}/repos/{repo}/tarball/{sha}", method="GET", headers=self._h
+        )
+        return urllib.request.urlopen(req, timeout=180)
 
 
 def whoami(gh: GitHub, kind: str) -> str:
@@ -871,6 +886,171 @@ def anchor_violations(envelopes: list[dict], diff: str) -> list[tuple[str, dict]
     ]
 
 
+# Fractions of max_context_chars, not absolute sizes, so one config knob scales the
+# whole pack. Must sum to 1.0 — tests/test_context.py asserts it. Slack in an
+# underfilled part is deliberately NOT reallocated: that is a tuning-time
+# optimisation with no evidence behind it yet.
+CONTEXT_SHARES = {
+    "changed_files": 0.48,
+    "call_sites": 0.18,
+    "conventions": 0.14,
+    "requirements": 0.13,
+    "tree": 0.07,
+}
+
+
+def budgets(total: int) -> dict[str, int]:
+    return {part: int(total * share) for part, share in CONTEXT_SHARES.items()}
+
+
+class Accounting:
+    """Enforces per-part budgets and records what each part actually used.
+
+    Truncation is always marked in-band: a lens that cannot tell a truncated
+    section from a complete one will treat absence as evidence, which is exactly
+    the failure the porting note warns about.
+    """
+
+    def __init__(self, limits: dict[str, int]) -> None:
+        self.limits = limits
+        self.used = {part: 0 for part in limits}
+        self.truncated: set[str] = set()
+
+    def add(self, part: str, text: str) -> str:
+        limit = self.limits[part]
+        if len(text) > limit:
+            self.truncated.add(part)
+            marker = f"\n\n… truncated: {part} exceeded its {limit}-character budget …\n"
+            text = text[: max(0, limit - len(marker))] + marker
+        self.used[part] = len(text)
+        return text
+
+    def report(self) -> None:
+        for part, limit in self.limits.items():
+            used = self.used[part]
+            flag = " TRUNCATED" if part in self.truncated else ""
+            state = "empty" if used == 0 else f"{used}/{limit} chars"
+            log(f"    context {part}: {state}{flag}")
+
+
+def stream_capped(response, dest: Path, cap: int) -> bool:
+    """Stream `response` to `dest`, aborting past `cap` bytes. True if complete.
+
+    The tarball size is not known before the download starts, so the cap is
+    enforced as it arrives. On abort the partial file is removed — a truncated
+    archive is worse than none, because it extracts a plausible-looking subset.
+    """
+    written = 0
+    try:
+        with dest.open("wb") as fh:
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    return True
+                written += len(chunk)
+                if written > cap:
+                    fh.close()
+                    dest.unlink(missing_ok=True)
+                    return False
+                fh.write(chunk)
+    except Exception:  # noqa: BLE001 - a failed download degrades the pack, never the review
+        dest.unlink(missing_ok=True)
+        return False
+
+
+def extract_checkout(archive: Path, dest: Path) -> Path | None:
+    """Extract a GitHub tarball and return its single top-level directory.
+
+    `filter="data"` is what refuses absolute paths, traversal entries, symlinks
+    out of the tree and device files. It is stdlib from 3.12, which is why no
+    dependency is needed here.
+    """
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "r:gz") as tf:
+            tf.extractall(dest, filter="data")
+    except Exception as exc:  # noqa: BLE001
+        vlog(f"    context: could not extract {archive.name}: {exc}")
+        return None
+    tops = [p for p in dest.iterdir() if p.is_dir()]
+    return tops[0] if len(tops) == 1 else dest
+
+
+def fetch_checkout(gh: GitHub, repo: str, sha: str, dest: Path, cap: int) -> Path | None:
+    """A read-only checkout at `sha`, or None if it could not be obtained."""
+    archive = dest / "src.tar.gz"
+    try:
+        with gh.open_tarball(repo, sha) as resp:
+            if not stream_capped(resp, archive, cap):
+                log(f"  context: tarball for {repo}@{sha[:7]} exceeded {cap} bytes; degrading")
+                return None
+    except Exception as exc:  # noqa: BLE001
+        log(f"  context: could not fetch tarball for {repo}@{sha[:7]} ({exc}); degrading")
+        return None
+    return extract_checkout(archive, dest / "tree")
+
+
+class Context:
+    """What the lenses get beyond the diff. `pack` is "" when there is nothing."""
+
+    def __init__(self, requirements: str) -> None:
+        self.pack = ""
+        self.requirements = requirements
+        self.notes: list[str] = []
+        self.root: Path | None = None
+
+
+@contextmanager
+def build_context(
+    gh: GitHub | None,
+    repo: str,
+    pr: dict,
+    diff: str,
+    cfg: dict,
+    *,
+    enabled: bool,
+    worktree: str | None = None,
+):
+    """Assemble the pack, owning the temp checkout for exactly one PR.
+
+    Never raises on a pack failure: a review with a thin pack is worth far more
+    than no review, so every path here degrades and records why in `notes`.
+    """
+    ctx = Context(pr.get("body") or "(none stated — judge against the PR title alone)")
+    if not enabled:
+        ctx.notes.append("context disabled")
+        yield ctx
+        return
+
+    tmp: tempfile.TemporaryDirectory | None = None
+    try:
+        if worktree:
+            root = Path(worktree).expanduser().resolve()
+            ctx.root = root if root.is_dir() else None
+            if ctx.root is None:
+                ctx.notes.append(f"--worktree {worktree} is not a directory")
+        elif gh is not None:
+            tmp = tempfile.TemporaryDirectory(prefix="pr-reviewer-")
+            head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name") or repo
+            ctx.root = fetch_checkout(
+                gh, head_repo, pr["head"]["sha"], Path(tmp.name), cfg["max_tarball_bytes"]
+            )
+            if ctx.root is None:
+                ctx.notes.append("no checkout; changed files fetched per-file")
+        else:
+            ctx.notes.append("no checkout available (offline without --worktree)")
+
+        acc = Accounting(budgets(cfg["max_context_chars"]))
+        # Parts are filled in Tasks 10-13.
+        acc.report()
+        for note in ctx.notes:
+            log(f"    context note: {note}")
+        yield ctx
+    finally:
+        if tmp is not None:
+            tmp.cleanup()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The pass
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1018,8 +1198,11 @@ def dispatch_lenses(lenses: tuple[str, ...], runner, *, stagger: bool) -> list[d
     return [results[lens] for lens in lenses]
 
 
-def run_panel(pr: dict, repo: str, diff: str, requirements: str, opts: argparse.Namespace) -> dict | None:
-    """Three lenses in parallel, then adjudication. None if nothing to adjudicate."""
+def run_panel(pr: dict, repo: str, diff: str, ctx: Context, opts: argparse.Namespace) -> dict | None:
+    """The first lens runs alone to write the cache prefix; the rest follow in
+    parallel once it has (see dispatch_lenses). Then adjudication.
+    None means there was nothing to adjudicate.
+    """
     lenses = tuple(opts.lens) if opts.lens else LENSES
     log(f"  dispatching {len(lenses)} lens(es) over {diff_size(diff)} changed lines")
 
@@ -1027,7 +1210,7 @@ def run_panel(pr: dict, repo: str, diff: str, requirements: str, opts: argparse.
         # A failed lens must not lose the other two, so the envelope is
         # synthesised here rather than allowed to escape dispatch_lenses.
         try:
-            return run_lens(lens, pr, repo, diff, requirements, "", opts.model_lens)
+            return run_lens(lens, pr, repo, diff, ctx.requirements, ctx.pack, opts.model_lens)
         except Exception as exc:  # noqa: BLE001
             log(f"    lens:{lens} FAILED: {exc}")
             return {"lens": lens, "status": "needs-input", "findings": [], "notes": f"failed: {exc}"}
@@ -1052,14 +1235,18 @@ def run_panel(pr: dict, repo: str, diff: str, requirements: str, opts: argparse.
     else:
         log("  anchors: all findings anchor inside the diff")
 
-    verdict = adjudicate(pr, repo, envelopes, requirements, opts.model_verdict)
+    # The adjudicator sees the lens envelopes, the PR body, the prior review and the
+    # resolved requirements — never the diff, and never ctx.pack. That is structural:
+    # doctrine/agents/pr-review-verdict.md explains why. Do not "fix" this.
+    verdict = adjudicate(pr, repo, envelopes, ctx.requirements, opts.model_verdict)
 
     if opts.save:
         out = Path(opts.save)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
             json.dumps(
-                {"repo": repo, "pr": pr["number"], "envelopes": envelopes, "verdict": verdict},
+                {"repo": repo, "pr": pr["number"], "pack": ctx.pack,
+                 "requirements": ctx.requirements, "envelopes": envelopes, "verdict": verdict},
                 indent=2,
             ),
             encoding="utf-8",
@@ -1100,14 +1287,15 @@ def review_pr(gh: GitHub, repo: str, pr: dict, cfg: dict, opts: argparse.Namespa
             gh.post(f"/repos/{repo}/pulls/{number}/reviews", {"event": "COMMENT", "body": park_body})
         return "parked (too large)"
 
-    # Requirements resolution is the plugin's step 6. Without issue-linking this
-    # is the PR body itself, which is what the lenses check conformity against.
-    requirements = pr.get("body") or "(none stated — judge against the PR title alone)"
-
     global CACHE_ENABLED
     CACHE_ENABLED = resolve_cache(opts, cfg)
 
-    verdict = run_panel(pr, repo, diff, requirements, opts)
+    with build_context(
+        gh, repo, pr, diff, cfg,
+        enabled=cfg.get("context", True) and not opts.no_context,
+        worktree=opts.worktree,
+    ) as ctx:
+        verdict = run_panel(pr, repo, diff, ctx, opts)
     if verdict is None:
         return "skipped (could not review)"
 
@@ -1139,7 +1327,13 @@ def review_diff_file(opts: argparse.Namespace) -> int:
     log(f"offline review of {opts.diff_file} ({diff_size(diff)} changed lines)")
     global CACHE_ENABLED
     CACHE_ENABLED = resolve_cache(opts)
-    verdict = run_panel(pr, opts.repo_name or "local/local", diff, pr["body"] or "(none stated)", opts)
+    cfg = dict(DEFAULTS)
+    with build_context(
+        None, opts.repo_name or "local/local", pr, diff, cfg,
+        enabled=not opts.no_context,
+        worktree=opts.worktree,
+    ) as ctx:
+        verdict = run_panel(pr, opts.repo_name or "local/local", diff, ctx, opts)
     if verdict is None:
         return 1
     show_review(verdict, "OFFLINE —")
@@ -1184,6 +1378,10 @@ With no target, falls back to $TARGET_REPOS — that is how it runs in-cluster.
                    help="doctrine directory (default: ./doctrine beside this script)")
     p.add_argument("--timeout", type=int, default=int(os.environ.get("REQUEST_TIMEOUT", "300")),
                    metavar="SECS", help="per-model-request timeout (default 300)")
+    p.add_argument("--no-context", action="store_true",
+                   help="disable the context pack (review from the diff alone)")
+    p.add_argument("--worktree", metavar="PATH",
+                   help="read context from a local checkout instead of fetching a tarball")
     p.add_argument("--save", metavar="FILE", help="write envelopes + verdict as JSON")
     p.add_argument("--env-file", default=str(HERE / ".env"), help="KEY=VALUE file to load (default: ./.env)")
     p.add_argument("-v", "--verbose", action="store_true", help="log raw model output")
