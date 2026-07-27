@@ -59,7 +59,7 @@ class TestAccounting(unittest.TestCase):
     def test_text_over_budget_is_truncated_with_a_marker(self):
         acc = review.Accounting({"tree": 40})
         out = acc.add("tree", "x" * 200)
-        self.assertLess(len(out), 200)
+        self.assertLessEqual(len(out), 40)
         self.assertIn("truncated", out)
 
     def test_usage_is_recorded_per_part(self):
@@ -67,6 +67,20 @@ class TestAccounting(unittest.TestCase):
         acc.add("tree", "abc")
         self.assertEqual(acc.used["tree"], 3)
         self.assertEqual(acc.used["conventions"], 0)
+
+    def test_truncated_output_never_exceeds_its_limit(self):
+        # 0 and 5 are too small to fit even a shortened marker; 40 fits a short
+        # marker but not the full one; 5000 is a realistic per-part budget.
+        for limit in (0, 5, 40, 5000):
+            with self.subTest(limit=limit):
+                acc = review.Accounting({"tree": limit})
+                out = acc.add("tree", "x" * 10000)
+                self.assertLessEqual(len(out), limit)
+
+    def test_used_matches_the_returned_length_when_truncated(self):
+        acc = review.Accounting({"tree": 40})
+        out = acc.add("tree", "x" * 200)
+        self.assertEqual(acc.used["tree"], len(out))
 
 
 class TestExtractCheckout(unittest.TestCase):
@@ -119,6 +133,60 @@ class TestStreamCapped(unittest.TestCase):
             dest = pathlib.Path(tmp) / "out.bin"
             self.assertFalse(review.stream_capped(self.FakeResponse(b"a" * 5000), dest, 100))
             self.assertFalse(dest.exists())
+
+
+class _FakeGH:
+    """A GitHub stand-in whose tarball is a real, valid archive on disk."""
+
+    def __init__(self, archive_path: pathlib.Path):
+        self._archive_path = archive_path
+
+    def open_tarball(self, repo, sha):
+        return open(self._archive_path, "rb")
+
+
+class TestBuildContext(unittest.TestCase):
+    def _pr(self, sha="abc123def"):
+        return {"number": 1, "title": "t", "body": "the PR body", "head": {"sha": sha}}
+
+    def test_a_malformed_max_context_chars_degrades_rather_than_raising(self):
+        cfg = dict(review.DEFAULTS)
+        cfg["max_context_chars"] = "oops-not-an-int"
+        with tempfile.TemporaryDirectory() as tmp:
+            with review.build_context(
+                None, "o/r", self._pr(), "", cfg, enabled=True, worktree=tmp
+            ) as ctx:
+                pass
+        self.assertEqual(ctx.pack, "")
+        self.assertTrue(
+            any("context assembly failed" in note for note in ctx.notes),
+            f"expected a 'context assembly failed' note, got {ctx.notes!r}",
+        )
+
+    def test_a_malformed_max_context_chars_leaves_no_temp_checkout_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            archive = make_archive(tmp, "owner-repo-abc123de", {"src/foo.py": "print(1)\n"})
+            gh = _FakeGH(archive)
+            cfg = dict(review.DEFAULTS)
+            cfg["max_context_chars"] = "oops-not-an-int"
+
+            system_tmp = pathlib.Path(tempfile.gettempdir())
+            before = set(system_tmp.glob("pr-reviewer-*"))
+            with review.build_context(gh, "owner/repo", self._pr(), "", cfg, enabled=True) as ctx:
+                self.assertEqual(ctx.pack, "")
+            after = set(system_tmp.glob("pr-reviewer-*"))
+            self.assertEqual(before, after)
+
+    def test_context_disabled_yields_an_empty_pack_with_exactly_one_note(self):
+        # Nothing else in this suite exercises build_context/Context directly;
+        # this is the cheapest path through it (no checkout, no accounting).
+        cfg = dict(review.DEFAULTS)
+        with review.build_context(None, "o/r", self._pr(), "", cfg, enabled=False) as ctx:
+            pass
+        self.assertEqual(ctx.pack, "")
+        self.assertEqual(ctx.notes, ["context disabled"])
+        self.assertIsNone(ctx.root)
 
 
 if __name__ == "__main__":

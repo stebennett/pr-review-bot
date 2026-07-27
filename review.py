@@ -918,12 +918,22 @@ class Accounting:
 
     def add(self, part: str, text: str) -> str:
         limit = self.limits[part]
-        if len(text) > limit:
-            self.truncated.add(part)
-            marker = f"\n\n… truncated: {part} exceeded its {limit}-character budget …\n"
-            text = text[: max(0, limit - len(marker))] + marker
-        self.used[part] = len(text)
-        return text
+        if len(text) <= limit:
+            self.used[part] = len(text)
+            return text
+        self.truncated.add(part)
+        # The marker itself costs characters, so at a small enough limit even it
+        # cannot fit — tried in order from most to least informative, falling
+        # all the way to a bare truncation with no marker rather than ever
+        # returning more than `limit` characters.
+        full = f"\n\n… truncated: {part} exceeded its {limit}-character budget …\n"
+        short = "\n… truncated …\n"
+        for marker in (full, short, ""):
+            if len(marker) <= limit:
+                break
+        out = text[: limit - len(marker)] + marker
+        self.used[part] = len(out)
+        return out
 
     def report(self) -> None:
         for part, limit in self.limits.items():
@@ -1040,9 +1050,13 @@ def build_context(
         else:
             ctx.notes.append("no checkout available (offline without --worktree)")
 
-        acc = Accounting(budgets(cfg["max_context_chars"]))
-        # Parts are filled in Tasks 10-13.
-        acc.report()
+        try:
+            acc = Accounting(budgets(cfg["max_context_chars"]))
+            # Parts are filled in Tasks 10-13.
+            acc.report()
+        except Exception as exc:  # noqa: BLE001 - a bad config must degrade the pack, never the review
+            ctx.notes.append(f"context assembly failed ({exc}); pack left empty")
+
         for note in ctx.notes:
             log(f"    context note: {note}")
         yield ctx
