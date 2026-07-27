@@ -82,6 +82,10 @@ DEFAULTS = {
 
 VERBOSE = False
 
+# Prefix caching is on by default and backed out by --no-cache or `"cache": false`.
+# It is a cost optimisation only: with it off, every call is a normal uncached call.
+CACHE_ENABLED = True
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -361,7 +365,80 @@ def describe_key(key: str) -> str:
     return shape + ("; " + "; ".join(problems) if problems else "; shape looks normal")
 
 
-def openrouter(model: str, system: str, user: str, schema: dict, *, label: str) -> dict:
+def seg(text: str, *, cache: bool = False) -> dict:
+    """One message content block. `cache` marks a cacheable prefix ending here.
+
+    Markers are omitted entirely when caching is disabled, rather than sent with a
+    falsey value — a provider that does not understand `cache_control` should never
+    see the key at all.
+    """
+    block = {"type": "text", "text": text}
+    if cache and CACHE_ENABLED:
+        block["cache_control"] = {"type": "ephemeral"}
+    return block
+
+
+def _blocks(content: str | list[dict]) -> list[dict]:
+    return [seg(content)] if isinstance(content, str) else content
+
+
+def completion_payload(
+    model: str, system: str | list[dict], user: str | list[dict], schema: dict, label: str
+) -> dict:
+    """The request body, split out from `openrouter` so it can be tested without HTTP."""
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _blocks(system)},
+            {"role": "user", "content": _blocks(user)},
+        ],
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": label.replace("-", "_").replace(":", "_"),
+                "strict": True,
+                "schema": schema,
+            },
+        },
+        # Without this, OpenRouter may route to a provider that does not support
+        # response_format and SILENTLY IGNORES it — the model then returns prose,
+        # json.loads fails, and the retry loop pays for another full generation
+        # before failing the same way. Restrict routing to providers that honour
+        # every parameter we send.
+        "provider": {"require_parameters": True},
+    }
+
+
+def strip_fence(text: str) -> str:
+    """Unwrap a markdown fence a provider wrapped its JSON object in.
+
+    `require_parameters` is meant to route only to providers that honour
+    `response_format`, and mostly it does — but a provider can honour it and
+    still emit a fenced object anyway. Without this, json.loads fails and the
+    retry ladder pays for an entire extra generation to fail the same way.
+    Observed in the Task 1 baseline run, not defensive programming.
+
+    Only an outermost wrapper is removed: a lens finding legitimately quotes
+    fenced code inside a string value, and that must survive untouched.
+    """
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    t = t.split("\n", 1)[1] if "\n" in t else t[3:]
+    if t.rstrip().endswith("```"):
+        t = t.rstrip()[:-3]
+    return t.strip()
+
+
+def openrouter(
+    model: str,
+    system: str | list[dict],
+    user: str | list[dict],
+    schema: dict,
+    *,
+    label: str,
+) -> dict:
     """One structured-output completion. Returns the parsed object.
 
     All the default models advertise `structured_outputs`, so the response is
@@ -372,24 +449,7 @@ def openrouter(model: str, system: str, user: str, schema: dict, *, label: str) 
     if not key:
         die("OPENROUTER_API_KEY is not set")
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": label.replace("-", "_").replace(":", "_"), "strict": True, "schema": schema},
-        },
-        # Without this, OpenRouter may route to a provider that does not
-        # support response_format and SILENTLY IGNORES it — the model then
-        # returns prose, json.loads fails, and the retry loop pays for another
-        # full generation before failing the same way. Restrict routing to
-        # providers that honour every parameter we send.
-        "provider": {"require_parameters": True},
-    }
+    payload = completion_payload(model, system, user, schema, label)
     headers = {
         "Authorization": f"Bearer {key}",
         "HTTP-Referer": "https://github.com/stebennett/home-lab-k8s",
@@ -397,7 +457,11 @@ def openrouter(model: str, system: str, user: str, schema: dict, *, label: str) 
     }
 
     timeout = int(os.environ.get("REQUEST_TIMEOUT", "300"))
-    approx_tokens = (len(system) + len(user)) // 4
+
+    def _text(content: str | list[dict]) -> str:
+        return content if isinstance(content, str) else "".join(b["text"] for b in content)
+
+    approx_tokens = (len(_text(system)) + len(_text(user))) // 4
     last: Exception | None = None
 
     for attempt in range(3):
@@ -433,15 +497,19 @@ def openrouter(model: str, system: str, user: str, schema: dict, *, label: str) 
                 raise RuntimeError(f"no choices in response: {json.dumps(body)[:300]}")
             content = body["choices"][0]["message"]["content"]
             usage = body.get("usage", {})
+            details = usage.get("prompt_tokens_details") or {}
+            cached = details.get("cached_tokens", 0)
+            discount = body.get("cache_discount")
             heartbeat.stop()
             log(
                 f"    {label}: response in {time.time() - started:.0f}s from "
                 f"{body.get('provider', model)} "
-                f"(in={usage.get('prompt_tokens', '?')} out={usage.get('completion_tokens', '?')})"
+                f"(in={usage.get('prompt_tokens', '?')} out={usage.get('completion_tokens', '?')} "
+                f"cached={cached} discount={discount if discount is not None else '-'})"
             )
             vlog(f"    {label} raw content:\n{content}")
             try:
-                return json.loads(content)
+                return json.loads(strip_fence(content))
             except json.JSONDecodeError as exc:
                 # The provider ignored response_format and returned prose.
                 # require_parameters should prevent this; show what came back
