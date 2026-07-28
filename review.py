@@ -1404,6 +1404,23 @@ def _fence(text: str) -> str:
     return "`" * max(3, longest + 1)
 
 
+def _truncate_inline(text: str, limit: int) -> str:
+    """`text` cut to at most `limit` characters, with an in-band marker.
+
+    A document-scale echo of `Accounting.add`'s own degrade-in-stages
+    approach: the marker is shortened, and finally dropped altogether, only
+    when `limit` is too small to hold it. Used instead of a bare `text[:limit]`
+    so a truncated document still visibly says so, exactly like a truncated
+    section does.
+    """
+    if limit <= 0:
+        return ""
+    for marker in ("\n… truncated …\n", "…", ""):
+        if len(marker) <= limit:
+            return text[: limit - len(marker)] + marker
+    return ""  # unreachable: "" always satisfies len(marker) <= limit
+
+
 def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]], acc: "Accounting") -> str:
     """The conventions documents governing the changed directories.
 
@@ -1440,6 +1457,16 @@ def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]]
     document's own `#`/`##` headings must stay visibly inside a quoted block
     rather than reading as more prompt structure at the same level as this
     section's own `## Repo conventions` heading.
+
+    Each block is truncated against the remaining budget *before* its
+    closing fence is written, document by document, rather than fencing
+    everything and handing the whole lot to `Accounting.add` in one shot: a
+    plain character-count cut has no notion of a fence, so it can land
+    inside one and leave it open — and everything `build_context` appends
+    after this section would then read as quoted content for the rest of
+    the pack. `acc.add` is still called exactly once, at the very end, as
+    the final authority on the budget (covering, for instance, a budget too
+    small even for the header alone).
     """
     if root is None:
         return ""
@@ -1478,21 +1505,57 @@ def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]]
     if not wanted:
         return ""
 
-    parts_out = []
+    header = (
+        "## Repo conventions\n\n"
+        "Context only. These are this repo's own stated rules and are what "
+        "\"consistent with the codebase\" means here — they outrank your own preferences.\n\n"
+    )
+
+    budget = max(0, acc.limits.get("conventions", 0))
+    used = len(header)
+    blocks: list[str] = []
+    truncated_a_document = False
     for rel in wanted:
         try:
             text = (root / rel).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         fence = _fence(text)
-        parts_out.append(f"### {rel}\n{fence}\n{text}\n{fence}\n")
+        sep = "\n" if blocks else ""
+        heading = f"### {rel}\n"
+        # Everything in the block except the body itself: the separator,
+        # the heading, both fence lines, and the newline after the body.
+        overhead = len(sep) + len(heading) + 2 * len(fence) + 3
+        remaining = budget - used - overhead
+        if remaining <= 0:
+            truncated_a_document = True
+            break
+        if len(text) > remaining:
+            text = _truncate_inline(text, remaining)
+            truncated_a_document = True
+        block = f"{sep}{heading}{fence}\n{text}\n{fence}\n"
+        blocks.append(block)
+        used += len(block)
+        if truncated_a_document:
+            break
 
-    header = (
-        "## Repo conventions\n\n"
-        "Context only. These are this repo's own stated rules and are what "
-        "\"consistent with the codebase\" means here — they outrank your own preferences.\n\n"
-    )
-    return acc.add("conventions", header + "\n".join(parts_out))
+    text_out = header + "".join(blocks)
+    if truncated_a_document:
+        acc.truncated.add("conventions")
+        # A document whose *own* body was cut already carries its own
+        # in-band marker (from `_truncate_inline`), but a document dropped
+        # outright — its wrapper alone didn't fit what was left — leaves no
+        # trace at all without this: a trailing, unfenced note, sized to
+        # whatever budget remains after the last block that did fit.
+        room = budget - len(text_out)
+        for marker in (
+            f"\n… truncated: conventions exceeded its {budget}-character budget …\n",
+            "\n… truncated …\n", "…", "",
+        ):
+            if len(marker) <= room:
+                text_out += marker
+                break
+    return acc.add("conventions", text_out)
 
 
 def pack_tree(root: Path | None, ranges: dict[str, list[tuple[int, int]]], cfg: dict, acc: "Accounting") -> str:
@@ -1810,6 +1873,32 @@ def resolve_requirements(gh, repo: str, pr: dict, acc: Accounting) -> str:
     return acc.add("requirements", "\n\n".join(parts))
 
 
+def _checkout_matches_diff(root: Path, diff: str) -> bool:
+    """True unless `root` is provably not a checkout of the repo this diff belongs to.
+
+    `is_dir()` alone proves nothing — `--worktree` is a free-form path, and a
+    real directory that happens to not be this repo (or a checkout of some
+    unrelated repo, or `/tmp`) would otherwise be trusted exactly as much as
+    a correct one: every part of the pack that reads from `root` would then
+    manufacture confident, unrelated context — a path tree of files that
+    aren't this repo's, "call sites" grepped out of code that was never
+    touched by this diff.
+
+    Checked against the diff's changed paths that existed *before* the
+    diff — a hunk with a real `old_path` (not `/dev/null`) names a file this
+    diff modified, renamed into, or deleted, and that file must already be
+    present in any correct checkout of the repo, however stale. A PR that
+    only adds new files supplies no such path: nothing here can prove or
+    disprove the checkout in that case, so it is left alone rather than
+    rejected on no evidence at all — a false rejection would silently thin
+    an otherwise-good pack for the ordinary case of an all-new-files PR.
+    """
+    existing = {new for new, old, *_ in _hunks(diff) if old is not None and new is not None}
+    if not existing:
+        return True
+    return any((root / rel).is_file() for rel in existing)
+
+
 @contextmanager
 def build_context(
     gh: GitHub | None,
@@ -1849,6 +1938,13 @@ def build_context(
                 ctx.notes.append("no checkout; changed files fetched per-file")
         else:
             ctx.notes.append("no checkout available (offline without --worktree)")
+
+        if ctx.root is not None and not _checkout_matches_diff(ctx.root, diff):
+            ctx.notes.append(
+                f"checkout at {ctx.root} matches none of the diff's pre-existing changed "
+                "paths; treating as no checkout"
+            )
+            ctx.root = None
 
         try:
             acc = Accounting(budgets(cfg["max_context_chars"]))

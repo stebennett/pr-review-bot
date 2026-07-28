@@ -257,6 +257,168 @@ class TestBuildContext(unittest.TestCase):
         self.assertNotIn("elided", ctx.pack)
         self.assertEqual(ctx.notes, [])
 
+    def test_a_truncated_conventions_document_still_ends_with_a_balanced_fence(self):
+        # Round-3-fix regression: a fence-unaware character cut can land
+        # inside an open code fence, after which everything build_context
+        # appends afterwards (here, "## Path tree (pruned)") would read as
+        # quoted content. Swept across three budgets so this does not hinge
+        # on one lucky threshold.
+        diff = (
+            "diff --git a/src/foo.py b/src/foo.py\n"
+            "--- a/src/foo.py\n"
+            "+++ b/src/foo.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        doc = "# Title\n\n```\nexample\n```\n\n" + "filler " * 2000
+        for max_chars in (3000, 2800, 2600):
+            with self.subTest(max_chars=max_chars):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp = pathlib.Path(tmp)
+                    make_tree(tmp, {"src/foo.py": "new\n", "CLAUDE.md": doc})
+                    cfg = dict(review.DEFAULTS)
+                    cfg["max_context_chars"] = max_chars
+                    with review.build_context(
+                        None, "o/r", self._pr(), diff, cfg, enabled=True, worktree=str(tmp)
+                    ) as ctx:
+                        pass
+                fence = "````"  # the doc's own longest run is 3, so its wrapper is 4
+                self.assertEqual(ctx.pack.count(fence), 2)
+                start = ctx.pack.index(fence) + len(fence)
+                end = ctx.pack.index(fence, start)
+                after_conventions = ctx.pack[end + len(fence):]
+                self.assertIn("## Path tree (pruned)", after_conventions)
+                # The truncation is still visible in-band, just not fence-breaking.
+                self.assertIn("truncated", ctx.pack)
+
+    def test_a_root_containing_a_changed_path_is_accepted_unchanged(self):
+        # The positive case: a worktree that plausibly is this repo must be
+        # used exactly as before — no note, full pack.
+        diff = (
+            "diff --git a/src/foo.py b/src/foo.py\n"
+            "--- a/src/foo.py\n"
+            "+++ b/src/foo.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            make_tree(tmp, {"src/foo.py": "new\n", "CLAUDE.md": "Root rules.\n"})
+            cfg = dict(review.DEFAULTS)
+            with review.build_context(
+                None, "o/r", self._pr(), diff, cfg, enabled=True, worktree=str(tmp)
+            ) as ctx:
+                pass
+        self.assertEqual(ctx.root, tmp.resolve())
+        self.assertEqual(ctx.notes, [])
+        self.assertIn("src/foo.py", ctx.pack)
+        self.assertIn("Root rules.", ctx.pack)
+
+    def test_a_root_matching_none_of_the_diffs_changed_paths_degrades_to_no_checkout(self):
+        # The exact scenario from the finding: a real, unrelated directory
+        # (e.g. --worktree pointed at /tmp) must not be trusted just because
+        # is_dir() is true.
+        diff = (
+            "diff --git a/src/foo.py b/src/foo.py\n"
+            "--- a/src/foo.py\n"
+            "+++ b/src/foo.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            make_tree(tmp, {"totally/unrelated/thing.py": "x = 1\n", "CLAUDE.md": "Unrelated rules.\n"})
+            cfg = dict(review.DEFAULTS)
+            with review.build_context(
+                None, "o/r", self._pr(), diff, cfg, enabled=True, worktree=str(tmp)
+            ) as ctx:
+                pass
+        self.assertIsNone(ctx.root)
+        self.assertTrue(
+            any("matches none of the diff" in note for note in ctx.notes),
+            f"expected a degrade note, got {ctx.notes!r}",
+        )
+        self.assertNotIn("totally/unrelated", ctx.pack)
+        self.assertNotIn("## Path tree (pruned)", ctx.pack)
+        self.assertNotIn("## Repo conventions", ctx.pack)
+        self.assertNotIn("Unrelated rules.", ctx.pack)
+
+    def test_a_root_missing_only_a_diffs_brand_new_files_is_still_accepted(self):
+        # The mostly-new-files edge case: a PR that only adds new files gives
+        # no changed path that must already exist anywhere, so a merely
+        # stale-but-correct checkout (it has the rest of the repo, just not
+        # yet this PR's brand-new file) must not be rejected on that basis.
+        diff = (
+            "diff --git a/src/new_thing.py b/src/new_thing.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/src/new_thing.py\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+brand new content\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            make_tree(tmp, {"README.md": "hi\n", "src/existing.py": "x = 1\n"})
+            cfg = dict(review.DEFAULTS)
+            with review.build_context(
+                None, "o/r", self._pr(), diff, cfg, enabled=True, worktree=str(tmp)
+            ) as ctx:
+                pass
+        self.assertEqual(ctx.root, tmp.resolve())
+        self.assertFalse(any("matches none of the diff" in note for note in ctx.notes))
+
+
+class TestCheckoutMatchesDiff(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_root_with_a_modified_files_path_matches(self):
+        make_tree(self.root, {"src/foo.py": "new\n"})
+        diff = (
+            "diff --git a/src/foo.py b/src/foo.py\n"
+            "--- a/src/foo.py\n"
+            "+++ b/src/foo.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        self.assertTrue(review._checkout_matches_diff(self.root, diff))
+
+    def test_a_root_without_the_modified_files_path_does_not_match(self):
+        make_tree(self.root, {"totally/unrelated/thing.py": "x = 1\n"})
+        diff = (
+            "diff --git a/src/foo.py b/src/foo.py\n"
+            "--- a/src/foo.py\n"
+            "+++ b/src/foo.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        self.assertFalse(review._checkout_matches_diff(self.root, diff))
+
+    def test_a_diff_of_only_brand_new_files_always_matches(self):
+        # No pre-existing path to check against: nothing here can prove or
+        # disprove the checkout, so it is not rejected.
+        make_tree(self.root, {"README.md": "hi\n"})
+        diff = (
+            "diff --git a/src/new_thing.py b/src/new_thing.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/src/new_thing.py\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+brand new content\n"
+        )
+        self.assertTrue(review._checkout_matches_diff(self.root, diff))
+
+    def test_an_empty_diff_matches(self):
+        make_tree(self.root, {"README.md": "hi\n"})
+        self.assertTrue(review._checkout_matches_diff(self.root, ""))
+
 
 class TestPathMatches(unittest.TestCase):
     PATTERNS = ["*.lock", "package-lock.json", "**/generated/**"]
