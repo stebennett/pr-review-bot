@@ -11,6 +11,9 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import review  # noqa: E402
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from test_context import unclosed_fence  # noqa: E402  (the independent fence checker)
+
 
 class TestSeg(unittest.TestCase):
     def test_plain_block_carries_no_cache_control(self):
@@ -188,6 +191,116 @@ class TestLensPromptBlocks(unittest.TestCase):
             text.index(review.DOC("lenses/_shared.md")),
             "the porting note must come before the doctrine it overrides",
         )
+
+
+# The diff itself can carry markdown fences — an ordinary documentation PR,
+# not a crafted attack. A context line renders as " ```" (single leading
+# space), an added/removed line as "+```"/"-```". All three must be counted
+# when sizing the wrapper around the whole diff.
+FENCE_ALL_MARKERS_DIFF = (
+    "diff --git a/docs/notes.md b/docs/notes.md\n"
+    "--- a/docs/notes.md\n"
+    "+++ b/docs/notes.md\n"
+    "@@ -1,4 +1,4 @@\n"
+    " # Notes\n"
+    " ```\n"
+    "-old example\n"
+    "-```\n"
+    "+new example\n"
+    "+```\n"
+)
+
+# A nested example escaped with four backticks, same as CLAUDE.md's own
+# convention docs — the wrapper must outrun this, not just upgrade to four.
+FOUR_BACKTICK_FENCE_DIFF = (
+    "diff --git a/docs/notes.md b/docs/notes.md\n"
+    "--- a/docs/notes.md\n"
+    "+++ b/docs/notes.md\n"
+    "@@ -1,3 +1,4 @@\n"
+    " # Notes\n"
+    " ````\n"
+    "+new line inside the nested example\n"
+    " ````\n"
+)
+
+# The reproducing case: a hunk showing only a fence's opener, never its
+# closer (an ordinary `gh pr diff` context window). One occurrence — odd.
+ODD_FENCE_DIFF = (
+    "diff --git a/docs/notes.md b/docs/notes.md\n"
+    "--- a/docs/notes.md\n"
+    "+++ b/docs/notes.md\n"
+    "@@ -10,3 +10,4 @@\n"
+    " ```\n"
+    " example()\n"
+    "+trailing comment\n"
+)
+
+# Both the opener and the closer are unchanged context lines — two
+# occurrences, even.
+EVEN_FENCE_DIFF = (
+    "diff --git a/docs/notes.md b/docs/notes.md\n"
+    "--- a/docs/notes.md\n"
+    "+++ b/docs/notes.md\n"
+    "@@ -1,5 +1,5 @@\n"
+    " # Notes\n"
+    " ```\n"
+    "-example old\n"
+    "+example new\n"
+    " ```\n"
+)
+
+
+class TestDiffFenceWrapping(unittest.TestCase):
+    """The diff wrapped into the lens prompt (`## Diff ... ```diff ... ``` `)
+    can itself contain markdown fences — this repo's own docs are full of
+    them, so an ordinary documentation PR reaches this. A fixed 3-backtick
+    wrapper is closed early by any embedded 3-or-more-backtick run, which
+    swallows everything build_lens_prompt appends after it: the rest of the
+    context pack, the lens brief, and LENS_TAIL. See CLAUDE.md."""
+
+    def setUp(self):
+        # The real doctrine's own fenced examples (lenses/_shared.md and
+        # each lens brief's ```json block) are each independently balanced,
+        # so they can coincidentally re-close a fence a broken diff wrapper
+        # left open — masking the defect at the point LENS_TAIL is checked,
+        # purely by luck of doc content. A backtick-free stand-in removes
+        # that confound and makes the diff wrapper the only variable.
+        real_doc = getattr(review, "DOC", None)
+        review.DOC = lambda path: f"(doctrine stand-in for {path}, no backticks)"
+        if real_doc is None:
+            self.addCleanup(delattr, review, "DOC")
+        else:
+            self.addCleanup(setattr, review, "DOC", real_doc)
+
+    def assembled(self, diff, pack=""):
+        system, user = review.build_lens_prompt("craft", PR, "o/r", diff, "the requirements", pack)
+        return "\n\n".join(b["text"] for b in system + user)
+
+    def assert_balanced_and_tail_outside(self, diff):
+        text = self.assembled(diff)
+        self.assertIsNone(unclosed_fence(text), f"prompt left a fence open:\n{text[-200:]!r}")
+        self.assertIn(review.LENS_TAIL, text)
+        self.assertIsNone(
+            unclosed_fence(text[: text.index(review.LENS_TAIL)]),
+            "LENS_TAIL sits inside an open fence",
+        )
+
+    def test_a_three_backtick_fence_on_context_added_and_removed_lines_stays_balanced(self):
+        self.assert_balanced_and_tail_outside(FENCE_ALL_MARKERS_DIFF)
+
+    def test_a_four_backtick_fence_stays_balanced_not_merely_widened_to_four(self):
+        self.assert_balanced_and_tail_outside(FOUR_BACKTICK_FENCE_DIFF)
+
+    def test_a_diff_with_no_backticks_still_gets_a_plain_three_backtick_wrapper(self):
+        # No gratuitous widening: nothing in the diff forces a longer fence.
+        _, user = review.build_lens_prompt("craft", PR, "o/r", DIFF, "the requirements", "")
+        self.assertIn(f"```diff\n{DIFF}\n```\n", user[0]["text"])
+
+    def test_an_odd_number_of_fence_lines_in_the_diff_stays_balanced(self):
+        self.assert_balanced_and_tail_outside(ODD_FENCE_DIFF)
+
+    def test_an_even_number_of_fence_lines_in_the_diff_stays_balanced(self):
+        self.assert_balanced_and_tail_outside(EVEN_FENCE_DIFF)
 
 
 def flat(content) -> str:

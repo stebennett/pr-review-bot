@@ -2178,6 +2178,12 @@ def build_lens_prompt(
     readability. tests/test_prompting.py enforces it.
     """
     doctrine = "\n\n".join([DOC("agents/pr-review-lens.md"), DOC("lenses/_shared.md")])
+    # The diff is real repo content, not doctrine — a documentation PR routinely
+    # carries its own backtick fences (context lines render as " ```", added/
+    # removed ones as "+```"/"-```"), any of which can close a fixed 3-backtick
+    # wrapper early and spill everything after it — the rest of this prompt,
+    # the lens brief, LENS_TAIL — out unfenced. Size the wrapper to outrun it.
+    diff_fence = _fence(diff)
     shared = (
         f"pr: {pr['number']}\n"
         f"target_repo: {repo}\n\n"
@@ -2185,7 +2191,7 @@ def build_lens_prompt(
         f"## PR body\n{pr.get('body') or '(empty)'}\n\n"
         f"## Resolved requirements\n{requirements}\n\n"
         f"## Prior recommendations\n{pr.get('_prior_body') or '(none — this is round 1)'}\n\n"
-        f"## Diff (`gh pr diff` canonical rendering)\n```diff\n{diff}\n```\n"
+        f"## Diff (`gh pr diff` canonical rendering)\n{diff_fence}diff\n{diff}\n{diff_fence}\n"
     )
     if pack:
         shared += f"\n{pack}\n"
