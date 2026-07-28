@@ -148,6 +148,38 @@ class TestAccounting(unittest.TestCase):
         self.assertEqual(acc.truncated, set())
 
 
+class TestTruncateInline(unittest.TestCase):
+    """One embedded convention document cut against what is left of a budget.
+    Swept the way `Accounting.add` is swept 0-80: the small limits are exactly
+    where a marker ladder goes silent instead of shrinking one more step, and
+    a document that truncates with no marker teaches the lens that absence is
+    evidence."""
+
+    DOC = "# Conventions\n\n" + "rule text " * 200
+
+    def test_the_kept_prefix_is_the_documents_own_opening(self):
+        # It always cuts and always marks — pack_conventions calls it only when
+        # the document does not fit, and owns the "it fits" case itself — so what
+        # matters is that what survives is a real prefix of the document.
+        out = review._truncate_inline(self.DOC, 60)
+        self.assertTrue(self.DOC.startswith(out.split("…")[0].rstrip("\n")))
+        self.assertTrue(out.startswith("# Conventions"))
+
+    def test_every_limit_from_0_to_40_stays_within_budget_and_is_marked(self):
+        for limit in range(0, 41):
+            with self.subTest(limit=limit):
+                out = review._truncate_inline(self.DOC, limit)
+                self.assertLessEqual(len(out), limit)
+                if limit >= 1:
+                    self.assertIn(
+                        "…", out, f"limit={limit} truncated the document silently")
+
+    def test_a_zero_or_negative_limit_yields_nothing(self):
+        for limit in (0, -1, -100):
+            with self.subTest(limit=limit):
+                self.assertEqual(review._truncate_inline(self.DOC, limit), "")
+
+
 class TestExtractCheckout(unittest.TestCase):
     def test_the_top_level_directory_is_returned(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -534,6 +566,36 @@ class TestCheckoutMatchesDiff(unittest.TestCase):
         )
         self.assertFalse(review._checkout_matches_diff(self.root, diff))
 
+    def test_one_of_two_pre_existing_paths_being_present_is_enough(self):
+        # The check is `any`, not `all`, and every other fixture here has exactly
+        # one pre-existing path — which makes the two identical and let `all`
+        # survive as a mutation. Two paths, one of them absent locally: a
+        # checkout that genuinely is this repo but is missing one touched file
+        # (deleted since, added in a commit the checkout predates, or excluded
+        # from a sparse checkout) must still be accepted. Rejecting it silently
+        # thins the whole pack.
+        make_tree(self.root, {"src/present.py": "here\n"})
+        diff = (
+            "diff --git a/src/present.py b/src/present.py\n"
+            "--- a/src/present.py\n"
+            "+++ b/src/present.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+here\n"
+            "diff --git a/src/absent.py b/src/absent.py\n"
+            "--- a/src/absent.py\n"
+            "+++ b/src/absent.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        self.assertEqual(
+            {"src/present.py", "src/absent.py"},
+            {old for _new, old, *_ in review._hunks(diff) if old is not None},
+            "fixture must offer two pre-existing paths for this to test anything",
+        )
+        self.assertTrue(review._checkout_matches_diff(self.root, diff))
+
     def test_a_rename_with_modification_matches_a_correct_pre_rename_checkout(self):
         # Round-4 fix: the check must collect the *old* path, not the new
         # one. A checkout that genuinely is this repo, just not yet at a
@@ -637,6 +699,22 @@ class TestMergeRanges(unittest.TestCase):
     def test_distant_ranges_stay_separate(self):
         self.assertEqual(review.merge_ranges([(10, 12), (500, 502)], 5), [(5, 17), (495, 507)])
 
+    def test_ranges_that_become_merely_adjacent_after_padding_still_merge(self):
+        # The `+ 1` adjacency term: without it, ranges that end and begin on
+        # consecutive lines stay two ranges. Every other fixture here overlaps
+        # after padding, which merges with or without the term.
+        self.assertEqual(review.merge_ranges([(10, 10), (11, 11)], 0), [(10, 11)])
+
+    def test_a_merged_pair_never_renders_a_line_twice(self):
+        # What the term is *for*: unmerged overlapping ranges make windowed()
+        # emit the shared lines once per range, so the lens is shown line 13
+        # twice and cannot trust the numbering it is told to anchor against.
+        text = "\n".join(f"line{n}" for n in range(1, 21))
+        out = review.windowed(text, review.merge_ranges([(10, 12), (14, 16)], 1))
+        self.assertEqual(out.count("13: line13"), 1)
+        # One contiguous block: elisions before and after it, none inside.
+        self.assertEqual(out.count("elided"), 2)
+
 
 class TestWindowed(unittest.TestCase):
     TEXT = "\n".join(f"line{i}" for i in range(1, 101))
@@ -657,6 +735,18 @@ class TestWindowed(unittest.TestCase):
     def test_a_full_span_needs_no_elision_marker(self):
         out = review.windowed(self.TEXT, [(1, 100)])
         self.assertNotIn("elided", out)
+
+    def test_the_trailing_elision_states_its_count_exactly(self):
+        # assertNotIn("elided") only proves a marker is absent, so an off-by-one
+        # in the trailing count survived. The count is asserted exactly, as the
+        # interior one already is: the porting note tells the lens to trust that
+        # number when deciding what it has not seen.
+        out = review.windowed(self.TEXT, [(1, 40)])
+        self.assertTrue(out.endswith("… 60 lines elided …"), out[-40:])
+
+    def test_a_window_ending_one_line_short_elides_exactly_one_line(self):
+        out = review.windowed(self.TEXT, [(1, 99)])
+        self.assertTrue(out.endswith("… 1 lines elided …"), out[-40:])
 
 
 class TestPackChangedFiles(unittest.TestCase):
@@ -1706,8 +1796,9 @@ class TestPackConventions(unittest.TestCase):
     def test_a_shallower_but_adjacent_file_outranks_a_deeper_but_distant_one(self):
         # The exact reproduction from the round-2 finding: a/CLAUDE.md sits
         # directly in the changed directory "a" (distance 0), while
-        # x/y/AGENTS.md is two levels above the changed directory "x/y/z"
-        # (distance 2) despite x/y being absolutely deeper than "a". The
+        # x/y/AGENTS.md is one level above the changed directory "x/y/z"
+        # (distance 1; 2 is its absolute depth, which is the number the old,
+        # wrong rule sorted on) despite x/y being absolutely deeper than "a". The
         # adjacent file must survive a tight budget; the merely-deeper one
         # must not. Swept across three budgets so this does not hinge on one
         # lucky threshold.

@@ -382,12 +382,48 @@ class TestDispatchLenses(unittest.TestCase):
         self.assertEqual(events[1], ("end", "a"))
 
     def test_results_come_back_in_lens_order_not_completion_order(self):
+        # Under staggering, "a" always completes first, so the old timings
+        # (a=0.06, b=0.02, c=0.04) made completion order a, b, c — identical to
+        # lens order, which left `return list(results.values())` green. The
+        # parallel pair is now timed so completion order is c, b: genuinely the
+        # reverse of the requested order for every lens that races.
         def runner(lens):
-            time.sleep({"a": 0.06, "b": 0.02, "c": 0.04}[lens])
+            time.sleep({"a": 0.0, "b": 0.09, "c": 0.01}[lens])
             return {"lens": lens}
 
         out = review.dispatch_lenses(("a", "b", "c"), runner, stagger=True)
         self.assertEqual([e["lens"] for e in out], ["a", "b", "c"])
+
+    def test_completion_order_really_is_the_reverse_of_lens_order(self):
+        # The premise of the test above, asserted rather than assumed: if the
+        # timings ever stop inverting the order, that test silently stops
+        # testing anything.
+        done = []
+
+        def runner(lens):
+            time.sleep({"a": 0.0, "b": 0.09, "c": 0.01}[lens])
+            done.append(lens)
+            return {"lens": lens}
+
+        review.dispatch_lenses(("a", "b", "c"), runner, stagger=True)
+        self.assertEqual(done, ["a", "c", "b"])
+
+    def test_two_lenses_stagger_the_same_way_three_do(self):
+        # `len(lenses) > 1` -> `> 2` survived: with two lenses the mutant runs
+        # both in parallel, so both pay the cache-write premium and neither
+        # reads — the exact cost staggering exists to avoid. Reached in the real
+        # deployment by `--lens a --lens b`.
+        events = []
+
+        def runner(lens):
+            events.append(("start", lens))
+            time.sleep(0.05)
+            events.append(("end", lens))
+            return {"lens": lens}
+
+        out = review.dispatch_lenses(("a", "b"), runner, stagger=True)
+        self.assertEqual([e["lens"] for e in out], ["a", "b"])
+        self.assertEqual(events[:2], [("start", "a"), ("end", "a")])
 
     def test_the_trailing_lenses_run_concurrently(self):
         barrier = threading.Barrier(2, timeout=2)
