@@ -700,6 +700,41 @@ class TestPackChangedFiles(unittest.TestCase):
             self.root, None, "o/r", "sha", {"gone.py": [(1, 1)]}, self.cfg, self.acc())
         self.assertIsInstance(out, str)
 
+    def test_the_fetched_checkout_is_the_only_source_that_claims_to_be_at_head(self):
+        # I3: the tarball and the per-file API are both fetched at `sha`, so
+        # "at the PR head" is a verified claim for them.
+        make_tree(self.root, {"src/foo.py": "alpha\n"})
+        out = review.pack_changed_files(
+            self.root, None, "o/r", "sha", {"src/foo.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertIn("## Changed files at head", out)
+
+    def test_a_local_worktree_never_claims_to_be_at_the_pr_head(self):
+        # _checkout_matches_diff deliberately accepts a stale checkout and
+        # nothing verifies the ref, so a --worktree may be on any branch (the
+        # one this was measured against was on main). A lens shown pre-change
+        # code labelled "as they stand at the PR head" reports the change
+        # missing, which is a fabricated blocking finding.
+        make_tree(self.root, {"src/foo.py": "alpha\n"})
+        out = review.pack_changed_files(
+            self.root, None, "o/r", "sha", {"src/foo.py": [(1, 1)]}, self.cfg, self.acc(),
+            local_checkout=True)
+        self.assertNotIn("## Changed files at head", out)
+        self.assertIn("local checkout", out)
+        self.assertIn("NOT known to be at the PR head", out)
+
+    def test_build_context_marks_a_worktree_as_local_and_a_tarball_as_head(self):
+        # The wiring, not just the parameter: --worktree must reach the header.
+        diff = ("diff --git a/src/foo.py b/src/foo.py\n"
+                "--- a/src/foo.py\n+++ b/src/foo.py\n@@ -1,1 +1,1 @@\n-old\n+alpha\n")
+        make_tree(self.root, {"src/foo.py": "alpha\n"})
+        pr = {"number": 1, "title": "t", "body": "b", "head": {"sha": "abc1234"}}
+        with review.build_context(
+            None, "o/r", pr, diff, self.cfg, enabled=True, worktree=str(self.root)
+        ) as ctx:
+            pass
+        self.assertIn("## Changed files from a local checkout", ctx.pack)
+        self.assertNotIn("## Changed files at head", ctx.pack)
+
     def test_no_source_at_all_emits_nothing_rather_than_a_false_reason(self):
         # I2: offline with --diff-file and no --worktree (the tuning loop in
         # CLAUDE.md) there is no checkout and no client, so nothing was ever

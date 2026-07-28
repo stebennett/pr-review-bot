@@ -1041,8 +1041,9 @@ def _trailer_groups(
 def pack_changed_files(
     root: Path | None, gh, repo: str, sha: str,
     ranges: dict[str, list[tuple[int, int]]], cfg: dict, acc: "Accounting",
+    *, local_checkout: bool = False,
 ) -> str:
-    """Every changed file at head, whole where it fits and windowed where it does not.
+    """Every changed file, whole where it fits and windowed where it does not.
 
     Allocation is by upgrade, not by division. Every earlier attempt to hand
     each file a share of the budget up front foundered on the same rock:
@@ -1105,11 +1106,25 @@ def pack_changed_files(
     chosen = eligible[:limit]
     cap_dropped = eligible[limit:]
 
+    # Only the tarball and the per-file API are fetched at `sha`, so only they
+    # may claim to be at head. A `--worktree` is a free-form local path and
+    # `_checkout_matches_diff` deliberately accepts a stale one, so labelling it
+    # "as they stand at the PR head" states something nothing has verified — and
+    # a lens shown pre-change code under that label reports the change missing
+    # ("the function you added isn't there"). Say what it actually is instead and
+    # let the lens weight it.
     header = (
         "## Changed files at head\n\n"
         "Context only. These are the touched files as they stand at the PR head, so you can "
         "see what each hunk sits inside. A finding still anchors to a diff line, never to a "
         "line you first saw here.\n\n"
+        if not local_checkout else
+        "## Changed files from a local checkout\n\n"
+        "Context only. These are the touched files as they stand in a local checkout, which "
+        "is NOT known to be at the PR head — it may predate the diff, in which case a hunk's "
+        "own change is simply not here yet. Use it to see what each hunk sits inside, and "
+        "never read its absence as the change being missing. A finding still anchors to a "
+        "diff line, never to a line you first saw here.\n\n"
     )
     budget = acc.limits["changed_files"]
 
@@ -2103,7 +2118,8 @@ def build_context(
             sections: list[str] = []
             ranges = diff_paths(diff)
             sections.append(pack_changed_files(
-                ctx.root, gh, repo, pr["head"]["sha"], ranges, cfg, acc))
+                ctx.root, gh, repo, pr["head"]["sha"], ranges, cfg, acc,
+                local_checkout=bool(worktree)))
             sections.append(pack_call_sites(ctx.root, diff, ranges, cfg, acc))
             sections.append(pack_conventions(ctx.root, ranges, acc))
             sections.append(pack_tree(ctx.root, ranges, cfg, acc))
