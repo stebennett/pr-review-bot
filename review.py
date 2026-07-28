@@ -814,7 +814,7 @@ def _open_fence(text: str) -> str | None:
     return "`" * open_len if open_len else None
 
 
-def truncation_markers(full: str | None = None) -> tuple[str, ...]:
+def _truncation_markers(full: str | None = None) -> tuple[str, ...]:
     """The in-band truncation ladder, most to least informative.
 
     A caller with something specific to say passes it as `full`; every caller
@@ -1054,8 +1054,9 @@ def pack_changed_files(
     of the budget went unspent. So instead:
 
     1. Every file starts at its cheapest rung, the tight window around its own
-       hunks. If even that does not fit, whole files are evicted until it does
-       — never a half-rendered one, and every eviction is named in the trailer.
+       hunks. Files are then admitted in priority order and the ones that no
+       longer fit are turned away — never a half-rendered one, and everything
+       turned away is named in the trailer.
     2. While budget remains, the highest-priority file that can afford its next
        rung takes it, and the scan restarts from the top. This only ever adds,
        so it cannot overrun, and it spends on the busiest files first.
@@ -1231,11 +1232,12 @@ def pack_changed_files(
     groups = _trailer_groups(ignored, cap_dropped, budget_dropped, with_names=True)
     assembled = header + "\n".join([bodies[r] for r in shown] + groups)
     if len(assembled) > budget:
-        # Only reachable with nothing shown at all: the loop above evicts until
-        # the section fits or there is nothing left to evict, and a budget too
-        # small even for the header plus a drop-list is still a budget this
-        # section must not overrun. Degrade the trailer in strictly smaller
-        # stages rather than let Accounting slice it mid-line.
+        # Only reachable with nothing shown at all: admission above turns away
+        # every file that does not fit and the give-back hands back the rest, so
+        # what is left over here is a budget too small even for the header plus a
+        # drop-list — still a budget this section must not overrun. Degrade the
+        # trailer in strictly smaller stages rather than let Accounting slice it
+        # mid-line.
         groups = _trailer_groups(ignored, cap_dropped, budget_dropped, with_names=False)
         assembled = header + "\n".join([bodies[r] for r in shown] + groups)
     if len(assembled) > budget:
@@ -1559,7 +1561,7 @@ def _truncate_inline(text: str, limit: int) -> str:
     balancing `_capped` does inside the cut costs nothing and keeps the
     property unconditional rather than conditional on that wrapper.
     """
-    return _capped(text, limit, truncation_markers())
+    return _capped(text, limit, _truncation_markers())
 
 
 def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]], acc: "Accounting") -> str:
@@ -1690,7 +1692,7 @@ def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]]
         # whatever budget remains after the last block that did fit.
         room = budget - len(text_out)
         full = f"\n… truncated: conventions exceeded its {budget}-character budget …\n"
-        for marker in truncation_markers(full):
+        for marker in _truncation_markers(full):
             if len(marker) <= room:
                 text_out += marker
                 break
@@ -1856,7 +1858,7 @@ class Accounting:
         # through this one method, so they are all covered by that guarantee at
         # once rather than each carrying its own fence arithmetic.
         full = f"\n\n… truncated: {part} exceeded its {limit}-character budget …\n"
-        out = _capped(text, limit, truncation_markers(full))
+        out = _capped(text, limit, _truncation_markers(full))
         self.used[part] = len(out)
         return out
 
@@ -1905,7 +1907,11 @@ def extract_checkout(archive: Path, dest: Path) -> Path | None:
         with tarfile.open(archive, "r:gz") as tf:
             tf.extractall(dest, filter="data")
     except Exception as exc:  # noqa: BLE001
-        vlog(f"    context: could not extract {archive.name}: {exc}")
+        # log(), not vlog(): this is the same class of event as fetch_checkout's
+        # own failures, which log unconditionally, and one of the things it
+        # reports is `filter="data"` refusing a path-traversal or symlink entry —
+        # never something to find out about only when someone happened to pass -v.
+        log(f"    context: could not extract {archive.name}: {exc}")
         return None
     tops = [p for p in dest.iterdir() if p.is_dir()]
     return tops[0] if len(tops) == 1 else dest

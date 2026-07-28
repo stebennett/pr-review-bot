@@ -200,6 +200,24 @@ class TestExtractCheckout(unittest.TestCase):
             self.assertIsNone(review.extract_checkout(archive, tmp / "out"))
             self.assertFalse((tmp / "escaped.txt").exists())
 
+    def test_a_refused_archive_is_reported_without_needing_verbose(self):
+        # It used to vlog(), while fetch_checkout logs the same class of event
+        # unconditionally — so a refused path-traversal or symlink archive was
+        # silent unless someone happened to pass -v.
+        said = []
+        real_log, real_vlog = review.log, review.vlog
+        review.log = said.append
+        review.vlog = lambda msg: None      # verbose off, as in the CronJob
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp = pathlib.Path(tmp)
+                bad = tmp / "bad.tar.gz"
+                bad.write_bytes(b"not a tarball at all")
+                review.extract_checkout(bad, tmp / "out")
+        finally:
+            review.log, review.vlog = real_log, real_vlog
+        self.assertTrue(any("could not extract" in m for m in said), said)
+
     def test_a_corrupt_archive_returns_none_rather_than_raising(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
