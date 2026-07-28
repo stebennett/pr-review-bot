@@ -113,7 +113,7 @@ reviewer/
     env.py              ~50   .env loading
     auth.py             ~60   GitHub App credentials and token resolution
     github.py          ~200   PRs, issues, comments, post_review
-    openrouter.py      ~240   HAND-ROLLED AND UNTOUCHED
+    openrouter.py      ~240   request shape frozen; transport ported (REQ-016)
     doctrine.py         ~30   loads doctrine/*.md from disk
     trees/
       local.py         ~140   LocalTree: read/walk/grep a real directory
@@ -248,10 +248,16 @@ and portable — while the edges are free to use libraries.
 ### REQ-010 — The core does not log
 **Status:** active
 
-Writing to stderr is a side effect. Exactly three call sites leak it into what becomes the pure
-core: `Accounting.report()` calls `log()` at `review.py:1868`, and `resolve_requirements` calls
-`vlog()` at `review.py:1992` and `:2002`. No `pack_*` assembler logs at all — verified against
-the source, and the narrowness is what makes the fix cheap.
+Writing to stderr is a side effect, and `die()` counts as one: it lives in `reviewer/log.py`
+alongside `log` and `vlog`, so the boundary of REQ-009 forbids all three to `core/`.
+
+Exactly four call sites leak into what becomes the pure core: `parse_target` calls `die()` at
+`review.py:654`; `Accounting.report()` calls `log()` at `:1868`; and `resolve_requirements` calls
+`vlog()` at `:1992` and `:2002`. Every other call site lands in `adapters/` or `app/`, where
+logging is permitted. No `pack_*` assembler logs at all.
+
+`parse_target` is the one to watch, because `die` reads as an error path rather than as logging:
+it raises instead, and `app/cli.py` converts the exception to the same message and exit code.
 
 Diagnostics from core travel back as data instead: `Accounting` already collects per-section
 budget usage and truncation notes, and `ctx.notes` already carries degradation reasons. `app/`
@@ -413,8 +419,10 @@ proves the token was accepted.
 The existing 263 tests already satisfy this: none opens a connection. The obligation binds the
 new work — the image smoke-test, the auth port, and the 422 inline-comment fallback.
 
-REQ-016's cache measurement is the sole exemption. It is inherently live, so it is a manual,
-recorded verification and never a CI job.
+Two verifications are exempt, because both are inherently live and neither can be satisfied by a
+stub one has written oneself: REQ-016's cache measurement, and REQ-015's confirmation that the
+GitHub client maps onto GitHub's real behaviour. Both are manual, both are recorded on their
+card, and neither is ever a CI job.
 
 ## Verification
 
@@ -517,7 +525,9 @@ change rather than as separately reopened scope.
 - **The two ledger follow-ups**: documenting `pack_changed_files`' 15-character margin with a
   property test, and skipping files whose diff covers their whole body. Both are behaviour or
   quality work, and this is a structural change.
-- **Rewriting `adapters/openrouter.py`**, for the reason given under Dependencies.
+- **Rewriting `adapters/openrouter.py`'s request shape or adopting an SDK for it.** Its transport
+  call *is* ported to httpx under REQ-016's measurement gate; everything else about the module is
+  out of scope.
 - **Any change to review quality, doctrine, prompts, or cost.** If a golden moves outside
   Stage 8, that is a defect, not an improvement.
 - **The hybrid `needs-context` re-dispatch round**, still deferred from the context-pack design.
