@@ -700,6 +700,41 @@ class TestPackChangedFiles(unittest.TestCase):
             self.root, None, "o/r", "sha", {"gone.py": [(1, 1)]}, self.cfg, self.acc())
         self.assertIsInstance(out, str)
 
+    def test_no_source_at_all_emits_nothing_rather_than_a_false_reason(self):
+        # I2: offline with --diff-file and no --worktree (the tuning loop in
+        # CLAUDE.md) there is no checkout and no client, so nothing was ever
+        # opened. The section used to emit a stub per changed file claiming each
+        # was "unreadable, binary, or over 524288 bytes" — a reason this code
+        # knows to be false. Also reached in production when the tarball and the
+        # per-file API both fail.
+        out = review.pack_changed_files(
+            None, None, "o/r", "sha",
+            {"src/a.py": [(1, 5)], "src/b.py": [(1, 5)]}, self.cfg, self.acc())
+        self.assertEqual(out, "")
+
+    def test_a_genuinely_oversized_file_still_says_why_it_was_skipped(self):
+        # The honest per-file message must survive: with a real checkout, "over
+        # N bytes" is a true statement about a file that was really stat'd.
+        make_tree(self.root, {"huge.py": "x\n" * 300_000, "ok.py": "fine\n"})
+        out = review.pack_changed_files(
+            self.root, None, "o/r", "sha",
+            {"huge.py": [(1, 1)], "ok.py": [(1, 1)]}, self.cfg, self.acc())
+        self.assertIn(f"over {review.MAX_SOURCE_BYTES} bytes", out)
+
+    def test_a_failed_api_fetch_does_not_claim_the_file_is_binary(self):
+        # The degraded per-file path: no checkout, and the API refuses. The file
+        # may be perfectly ordinary — the fetch is what failed — so the note
+        # must not assert anything about the file's contents.
+        class RefusingGH:
+            def file(self, repo, path, ref=None):
+                raise RuntimeError("502")
+
+        out = review.pack_changed_files(
+            None, RefusingGH(), "o/r", "sha", {"src/a.py": [(1, 5)]}, self.cfg, self.acc())
+        self.assertIn("src/a.py", out)
+        self.assertNotIn("binary", out)
+        self.assertIn("could not be fetched", out)
+
     def test_the_file_cap_names_what_was_dropped(self):
         files = {f"src/f{i}.py": f"body{i}\n" for i in range(30)}
         make_tree(self.root, files)
@@ -1128,7 +1163,8 @@ class TestPackChangedFiles(unittest.TestCase):
         make_tree(self.root, files)
 
         chosen = sorted(ranges, key=lambda p: (-len(ranges[p]), p))[:25]
-        floors = {r: review._file_tiers(r, files[r], ranges[r])[0][1] for r in chosen}
+        floors = {r: review._file_tiers(r, files[r], ranges[r], "skipped")[0][1]
+                  for r in chosen}
         for limit in (2500, 3000, 3500, 5000, 8000):
             with self.subTest(limit=limit):
                 acc = self.acc(limit=limit)

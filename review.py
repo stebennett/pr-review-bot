@@ -952,7 +952,9 @@ def _file_body(rel: str, text: str, file_ranges: list[tuple[int, int]], pad: int
     return f"### {rel}\n```\n{windowed(text, merge_ranges(file_ranges, pad))}\n```\n"
 
 
-def _file_tiers(rel: str, text: str | None, file_ranges: list[tuple[int, int]]) -> list[tuple[int, str]]:
+def _file_tiers(
+    rel: str, text: str | None, file_ranges: list[tuple[int, int]], skip_note: str
+) -> list[tuple[int, str]]:
     """`(pad, body)` rungs for one file in ascending cost and ascending content:
     the tightest window around the diff, the ±`WINDOW_PAD` window, the whole file.
 
@@ -964,9 +966,13 @@ def _file_tiers(rel: str, text: str | None, file_ranges: list[tuple[int, int]]) 
     treat "next rung" as unambiguously "more context for more characters".
 
     A file that could not be read has one rung: the placeholder saying so.
+    `skip_note` is that placeholder's wording, which the caller owns because
+    only the caller knows *why* — a file skipped out of a real checkout is
+    genuinely binary, oversized or unreadable, while one that never had a
+    checkout to be read from is a different statement entirely.
     """
     if text is None:
-        return [(0, f"### {rel}\n(skipped: unreadable, binary, or over {MAX_SOURCE_BYTES} bytes)\n")]
+        return [(0, f"### {rel}\n({skip_note})\n")]
     line_count = len(text.splitlines())
     rungs = [(line_count, _whole_file_body(rel, text))]
     for pad in (WINDOW_PAD, 0):
@@ -1068,6 +1074,29 @@ def pack_changed_files(
     if not ranges:
         return ""
 
+    if root is None and gh is None:
+        # No source of file contents exists at all: offline with `--diff-file`
+        # and no `--worktree`, which is the tuning loop CLAUDE.md documents.
+        # Emitting a stub per changed file here asserted a reason this code knows
+        # to be false — "unreadable, binary, or over 524288 bytes" of a file
+        # nobody ever tried to open — and a lens has no way to tell that apart
+        # from a repo full of genuinely unreadable files. The three sibling
+        # sections all return "" when they have no source, so this one does too;
+        # the real reason is already on `ctx.notes` and in the log, and
+        # LENS_TAIL tells the lens what an absent section means.
+        return ""
+
+    # Why a file is missing depends on where files were coming from, and only
+    # this function knows which: a checkout was stat'd and read, so binary or
+    # oversized is a true statement about the file, while on the degraded
+    # per-file API path the file may be perfectly ordinary and the fetch is what
+    # failed.
+    skip_note = (
+        f"skipped: unreadable, binary, or over {MAX_SOURCE_BYTES} bytes"
+        if root is not None else
+        "not shown: no checkout, and its contents could not be fetched"
+    )
+
     limit = max(0, cfg.get("max_context_files", 25))
     ignore = cfg.get("ignore_paths") or []
     ordered = sorted(ranges, key=lambda p: (-len(ranges[p]), p))
@@ -1090,7 +1119,7 @@ def pack_changed_files(
     tiers: dict[str, list[tuple[int, str]]] = {}
     for rel in chosen:
         texts[rel] = read_source(root, gh, repo, sha, rel)
-        tiers[rel] = _file_tiers(rel, texts[rel], ranges[rel])
+        tiers[rel] = _file_tiers(rel, texts[rel], ranges[rel], skip_note)
 
     shown: list[str] = []                                  # stays in priority order
     rung = {rel: 0 for rel in chosen}
