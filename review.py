@@ -1885,15 +1885,32 @@ def _checkout_matches_diff(root: Path, diff: str) -> bool:
     touched by this diff.
 
     Checked against the diff's changed paths that existed *before* the
-    diff — a hunk with a real `old_path` (not `/dev/null`) names a file this
-    diff modified, renamed into, or deleted, and that file must already be
-    present in any correct checkout of the repo, however stale. A PR that
-    only adds new files supplies no such path: nothing here can prove or
-    disprove the checkout in that case, so it is left alone rather than
-    rejected on no evidence at all — a false rejection would silently thin
-    an otherwise-good pack for the ordinary case of an all-new-files PR.
+    diff — a hunk with a real `old_path` (not `/dev/null`) names a file that
+    must already be present in any correct checkout of the repo, however
+    stale, whether this diff went on to modify, rename, or delete it. That
+    is deliberately the *old* name, not the new one: a rename-with-
+    modification's `old_path` is the file a correct pre-rename checkout
+    still has, while its `new_path` is not there yet — collecting `new_path`
+    instead would falsely reject a perfectly good, merely not-yet-renamed
+    checkout. A plain modification is unaffected either way, since its
+    `old_path` and `new_path` are the same string.
+
+    A PR that only adds new files, or only renames without modifying
+    content (which produces no hunk at all, so no old_path either),
+    supplies no such path: nothing here can prove or disprove the checkout
+    in that case, so it is left alone rather than rejected on no evidence
+    at all — a false rejection would silently thin an otherwise-good pack.
+
+    Two known gaps, both inherent to a single-path check under the
+    stdlib-only constraint (no proper git identity available without a
+    real clone): a diff touching only one pre-existing path that happens
+    to be absent from an otherwise-correct checkout is rejected outright
+    (no redundancy in a singleton `any()`), and a checkout of a *different*
+    repository that happens to share a common filename (`README.md`,
+    `src/index.ts`) with a touched path is wrongly accepted (one match is
+    all this looks for).
     """
-    existing = {new for new, old, *_ in _hunks(diff) if old is not None and new is not None}
+    existing = {old for new, old, *_ in _hunks(diff) if old is not None}
     if not existing:
         return True
     return any((root / rel).is_file() for rel in existing)

@@ -346,6 +346,37 @@ class TestBuildContext(unittest.TestCase):
         self.assertNotIn("## Repo conventions", ctx.pack)
         self.assertNotIn("Unrelated rules.", ctx.pack)
 
+    def test_a_deletion_only_diff_against_an_unrelated_root_degrades_via_build_context(self):
+        # Round-4 fix, exercised end-to-end: before the fix, collecting
+        # new_path (always None for a deletion) made a deletion-only diff
+        # match unconditionally, so this scenario silently produced
+        # confident wrong context with no note.
+        diff = (
+            "diff --git a/gone.py b/gone.py\n"
+            "deleted file mode 100644\n"
+            "--- a/gone.py\n"
+            "+++ /dev/null\n"
+            "@@ -1,1 +0,0 @@\n"
+            "-content\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            make_tree(tmp, {"totally/unrelated/thing.py": "x = 1\n", "CLAUDE.md": "Unrelated rules.\n"})
+            cfg = dict(review.DEFAULTS)
+            with review.build_context(
+                None, "o/r", self._pr(), diff, cfg, enabled=True, worktree=str(tmp)
+            ) as ctx:
+                pass
+        self.assertIsNone(ctx.root)
+        self.assertTrue(
+            any("matches none of the diff" in note for note in ctx.notes),
+            f"expected a degrade note, got {ctx.notes!r}",
+        )
+        self.assertNotIn("totally/unrelated", ctx.pack)
+        self.assertNotIn("## Path tree (pruned)", ctx.pack)
+        self.assertNotIn("## Repo conventions", ctx.pack)
+        self.assertNotIn("Unrelated rules.", ctx.pack)
+
     def test_a_root_missing_only_a_diffs_brand_new_files_is_still_accepted(self):
         # The mostly-new-files edge case: a PR that only adds new files gives
         # no changed path that must already exist anywhere, so a merely
@@ -400,6 +431,53 @@ class TestCheckoutMatchesDiff(unittest.TestCase):
             "+new\n"
         )
         self.assertFalse(review._checkout_matches_diff(self.root, diff))
+
+    def test_a_rename_with_modification_matches_a_correct_pre_rename_checkout(self):
+        # Round-4 fix: the check must collect the *old* path, not the new
+        # one. A checkout that genuinely is this repo, just not yet at a
+        # commit that renamed the file, has old/path.py and not
+        # new/path.py — it must not be falsely rejected for that.
+        make_tree(self.root, {"old/path.py": "old content\n"})
+        diff = (
+            "diff --git a/old/path.py b/new/path.py\n"
+            "similarity index 90%\n"
+            "rename from old/path.py\n"
+            "rename to new/path.py\n"
+            "--- a/old/path.py\n"
+            "+++ b/new/path.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old content\n"
+            "+new content\n"
+        )
+        self.assertTrue(review._checkout_matches_diff(self.root, diff))
+
+    def test_a_deletion_only_diff_is_rejected_against_an_unrelated_directory(self):
+        # Round-4 fix: collecting new_path made a deletion-only diff
+        # (new_path is always None for a deletion) match unconditionally,
+        # reinstating the "confident wrong context, no note" failure this
+        # check exists to remove.
+        make_tree(self.root, {"totally/unrelated/thing.py": "x = 1\n"})
+        diff = (
+            "diff --git a/gone.py b/gone.py\n"
+            "deleted file mode 100644\n"
+            "--- a/gone.py\n"
+            "+++ /dev/null\n"
+            "@@ -1,1 +0,0 @@\n"
+            "-content\n"
+        )
+        self.assertFalse(review._checkout_matches_diff(self.root, diff))
+
+    def test_a_deletion_only_diff_matches_a_checkout_containing_the_deleted_path(self):
+        make_tree(self.root, {"gone.py": "content\n"})
+        diff = (
+            "diff --git a/gone.py b/gone.py\n"
+            "deleted file mode 100644\n"
+            "--- a/gone.py\n"
+            "+++ /dev/null\n"
+            "@@ -1,1 +0,0 @@\n"
+            "-content\n"
+        )
+        self.assertTrue(review._checkout_matches_diff(self.root, diff))
 
     def test_a_diff_of_only_brand_new_files_always_matches(self):
         # No pre-existing path to check against: nothing here can prove or
