@@ -20,6 +20,33 @@ def make_tree(root: pathlib.Path, files: dict[str, str]) -> None:
         p.write_bytes(content.encode() if isinstance(content, str) else content)
 
 
+def unclosed_fence(text: str) -> str | None:
+    """The markdown fence `text` leaves open, or None if it is balanced.
+
+    Deliberately an independent implementation of `review._open_fence`, so a
+    mutation of that function cannot make the property tests below agree with
+    it. Fences are tracked by run *length*, the way CommonMark does, never by
+    counting "```" occurrences: an opener may carry an info string, a closer may
+    not, a closer must be at least as long as the opener, and only one fence is
+    ever open at a time (lines inside a fence are literal text, so a shorter
+    fence line inside a longer block opens nothing).
+    """
+    open_run = 0
+    for line in text.split("\n"):
+        stripped = line.lstrip(" ")
+        if len(line) - len(stripped) > 3 or not stripped.startswith("```"):
+            continue
+        run = len(stripped) - len(stripped.lstrip("`"))
+        rest = stripped[run:]
+        if "`" in rest:
+            continue                                  # not a fence line at all
+        if open_run == 0:
+            open_run = run                             # an info string is fine here
+        elif run >= open_run and not rest.strip():
+            open_run = 0
+    return "`" * open_run if open_run else None
+
+
 def make_archive(dest: pathlib.Path, top: str, files: dict[str, str]) -> pathlib.Path:
     """A GitHub-shaped tarball: one top-level owner-repo-sha directory."""
     staging = dest / "staging" / top
@@ -1362,6 +1389,10 @@ class TestPackCallSites(unittest.TestCase):
         self.assertLessEqual(len(out), 200)
         self.assertIn("call_sites", acc.truncated)
         self.assertIn("…", out)
+        # A marker is not enough: this cut lands inside the per-needle fence,
+        # and an open fence quotes every later section, the lens brief and
+        # LENS_TAIL along with it. See TestFenceBalanceUnderTruncation.
+        self.assertIsNone(unclosed_fence(out))
 
 
 class TestPackCallSitesDeterminism(unittest.TestCase):
@@ -1831,9 +1862,187 @@ class TestPackTree(unittest.TestCase):
         make_tree(self.root, {f"top{i:03d}.py": "" for i in range(400)})
         out = review.pack_tree(self.root, {}, self.cfg, self.acc(tree=200))
         self.assertIn("truncated", out)
+        # The cut lands inside the listing's own fence; leaving it open would
+        # quote the rest of the prompt. See TestFenceBalanceUnderTruncation.
+        self.assertIsNone(unclosed_fence(out))
 
     def test_no_checkout_yields_an_empty_section(self):
         self.assertEqual(review.pack_tree(None, {}, self.cfg, self.acc()), "")
+
+
+# ── C1: no cut may leave a fence open, in any section, at any budget ─────────
+#
+# One swept property, not a spot check per section. Every section is fenced
+# somewhere and every section is cut at a raw character offset against its own
+# budget, so "the marker appeared" is not the interesting assertion: an
+# unclosed fence swallows everything build_lens_prompt appends after the pack —
+# the remaining sections, `lens: <name>`, the whole lens brief, and LENS_TAIL's
+# anchoring rule and "Return only the JSON envelope" — into one quoted block.
+
+FENCE_DIFF = (
+    "diff --git a/src/pkg/app.py b/src/pkg/app.py\n"
+    "--- a/src/pkg/app.py\n"
+    "+++ b/src/pkg/app.py\n"
+    "@@ -1,3 +1,4 @@\n"
+    " import os\n"
+    "+def render_report_block(rows):\n"
+    "     return rows\n"
+)
+
+# A source file that documents a fenced example, which is ordinary in real code.
+FENCED_SOURCE = (
+    "import os\n"
+    "def render_report_block(rows):\n"
+    '    """Render rows.\n\n'
+    "    ```\n"
+    "    render_report_block([])\n"
+    "    ```\n"
+    '    """\n'
+    "    return rows\n"
+) + "".join(f"FILLER_LINE_{i} = {i}\n" for i in range(120))
+
+# A conventions document holding both a three- and a four-backtick block, so
+# the fence bookkeeping cannot get away with counting occurrences.
+FENCED_CONVENTIONS = (
+    "# Conventions\n\n## Style\n\n```\nexample()\n```\n\n"
+    "## Nested\n\n````\n```\ninner\n```\n````\n\n"
+) + "".join(f"- convention rule number {i}\n" for i in range(120))
+
+FENCED_BODY = (
+    "Reworks the report block.\n\n```python\n"
+    + "".join(f"sample_call({i})\n" for i in range(120))
+    + "```\n\nSee the issue for the rest.\n"
+)
+
+
+class TestFenceBalanceUnderTruncation(unittest.TestCase):
+    """C1: `Accounting.add` cuts at a raw offset and knows nothing about
+    structure. Fixed once in `_capped`, so it is asserted once, here, over
+    every section and over the assembled prompt."""
+
+    @classmethod
+    def setUpClass(cls):
+        review.DOC = review.Doctrine(
+            pathlib.Path(review.__file__).resolve().parent / "doctrine")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        files = {
+            "src/pkg/app.py": FENCED_SOURCE,
+            "src/pkg/CLAUDE.md": FENCED_CONVENTIONS,
+            "CLAUDE.md": FENCED_CONVENTIONS,
+        }
+        for i in range(8):
+            files[f"web/caller{i}.py"] = "".join(
+                f'render_report_block([f"`{j}`"])\n' for j in range(4))
+        for i in range(30):
+            files[f"top_level_file_{i:03d}.py"] = "x = 1\n"
+        make_tree(self.root, files)
+        self.cfg = dict(review.DEFAULTS)
+        self.ranges = review.diff_paths(FENCE_DIFF)
+        self.pr = {"number": 7, "title": "t", "body": FENCED_BODY,
+                   "head": {"sha": "abc1234"}, "_rounds": 0, "_prior_body": None}
+
+    def sections(self, limit):
+        """Every section rendered at the same per-part budget `limit`."""
+        parts = ("changed_files", "call_sites", "conventions", "requirements", "tree")
+        acc = review.Accounting({p: limit for p in parts})
+        return {
+            "changed_files": review.pack_changed_files(
+                self.root, None, "o/r", "sha", self.ranges, self.cfg, acc),
+            "call_sites": review.pack_call_sites(
+                self.root, FENCE_DIFF, self.ranges, self.cfg, acc),
+            "conventions": review.pack_conventions(self.root, self.ranges, acc),
+            "tree": review.pack_tree(self.root, self.ranges, self.cfg, acc),
+            "requirements": review.resolve_requirements(None, "o/r", self.pr, acc),
+        }, acc
+
+    def test_no_section_ends_inside_an_open_fence_at_any_budget(self):
+        # Swept rather than sampled: which fence a cut lands inside is a
+        # function of the budget, so a fixed budget only ever proves one
+        # offset. The step deliberately does not divide any section's length.
+        for limit in list(range(0, 400, 7)) + list(range(400, 6001, 143)):
+            text, _ = self.sections(limit)
+            for part, out in text.items():
+                with self.subTest(limit=limit, part=part):
+                    self.assertIsNone(
+                        unclosed_fence(out),
+                        f"{part} at limit {limit} left a fence open:\n{out[-200:]!r}")
+
+    def test_a_truncated_section_still_carries_its_marker_in_band(self):
+        # Closing the fence costs characters, and those characters must not come
+        # out of the marker: truncation stays visible at every budget that can
+        # hold a single character of it.
+        for limit in list(range(1, 400, 7)) + list(range(400, 6001, 143)):
+            text, acc = self.sections(limit)
+            for part in acc.truncated:
+                with self.subTest(limit=limit, part=part):
+                    self.assertIn(
+                        "…", text[part],
+                        f"{part} at limit {limit} was truncated with no marker")
+
+    def test_the_assembled_lens_prompt_never_ends_inside_an_open_fence(self):
+        # The property that actually matters: the lens must never read its own
+        # brief or LENS_TAIL as quoted code. Asserted on the whole prompt —
+        # doctrine, shared block and tail — not on the pack alone.
+        for total in list(range(0, 4001, 173)) + [8300, 20000, 83000]:
+            cfg = dict(review.DEFAULTS)
+            cfg["max_context_chars"] = total
+            with review.build_context(
+                None, "o/r", self.pr, FENCE_DIFF, cfg, enabled=True,
+                worktree=str(self.root),
+            ) as ctx:
+                pass
+            system, user = review.build_lens_prompt(
+                "craft", self.pr, "o/r", FENCE_DIFF, ctx.requirements, ctx.pack)
+            assembled = "\n\n".join(
+                [b["text"] for b in system] + [b["text"] for b in user])
+            with self.subTest(total=total):
+                self.assertIsNone(
+                    unclosed_fence(ctx.pack), f"pack left a fence open at {total}")
+                self.assertIsNone(
+                    unclosed_fence(ctx.requirements),
+                    f"requirements left a fence open at {total}")
+                self.assertIsNone(
+                    unclosed_fence(assembled),
+                    f"assembled prompt left a fence open at {total}")
+                # And the tail is really outside every fence, not merely present.
+                self.assertIn(review.LENS_TAIL, assembled)
+                self.assertIsNone(
+                    unclosed_fence(assembled[:assembled.index(review.LENS_TAIL)]),
+                    f"LENS_TAIL is inside an open fence at {total}")
+
+
+class TestClipHit(unittest.TestCase):
+    """A minified `.js` line is one line and may be half a megabyte of it —
+    `walk_source` admits the file, so the clip is what keeps a single hit from
+    spending the whole call-sites budget."""
+
+    def test_a_short_line_is_passed_through_stripped(self):
+        self.assertEqual(review._clip_hit("  call_it()  "), "call_it()")
+
+    def test_a_long_line_is_clipped_and_marked(self):
+        out = review._clip_hit("call_it(" + "x" * 5000 + ")")
+        self.assertLessEqual(len(out), review.MAX_HIT_CHARS + 20)
+        self.assertIn("…", out)
+
+    def test_a_minified_hit_cannot_blow_the_section_budget_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            make_tree(root, {
+                "src/service.py": "x = 1\n",
+                "web/bundle.js": "var a=1;" + "".join(
+                    f'require("src/service");z{i}=1;' for i in range(4000)) + "\n",
+            })
+            acc = review.Accounting({"changed_files": 1, "call_sites": 14940,
+                                     "conventions": 1, "requirements": 1, "tree": 1})
+            out = review.pack_call_sites(
+                root, "--- a/src/service.py\n+++ b/src/service.py\n@@ -1,1 +1,1 @@\n+x = 2\n",
+                {"src/service.py": [(1, 1)]}, dict(review.DEFAULTS), acc)
+            self.assertIn("web/bundle.js", out)
+            self.assertNotIn("call_sites", acc.truncated)
 
 
 if __name__ == "__main__":

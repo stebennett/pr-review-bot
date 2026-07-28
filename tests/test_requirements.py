@@ -7,6 +7,9 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import review  # noqa: E402
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from test_context import unclosed_fence  # noqa: E402  (the independent fence checker)
+
 
 class FakeGitHub:
     """Just enough GitHub for resolve_requirements."""
@@ -220,6 +223,23 @@ class TestResolveRequirementsInteractions(unittest.TestCase):
         out = review.resolve_requirements(gh, "o/r", self.pr(body="B" * 200), tiny)
         self.assertLessEqual(len(out), 50)
         self.assertIn("requirements", tiny.truncated)
+
+    def test_a_body_holding_a_code_block_is_not_cut_mid_fence(self):
+        # C1: an ordinary PR body with a fenced code block in it — the most
+        # reachable case of the whole defect, since the requirements string is
+        # cut against its own budget by default and also reaches adjudicate().
+        # An open fence quotes the diff, the lens brief and LENS_TAIL alike.
+        body = "Why\n\n```python\n" + "sample_call()\n" * 400 + "```\n\nEnd.\n"
+        for limit in (300, 700, 1500, 4000, 5111):
+            with self.subTest(limit=limit):
+                acc_ = review.Accounting({"changed_files": 1, "call_sites": 1,
+                                          "conventions": 1, "requirements": limit,
+                                          "tree": 1})
+                out = review.resolve_requirements(None, "o/r", self.pr(body=body), acc_)
+                self.assertLessEqual(len(out), limit)
+                self.assertIn("requirements", acc_.truncated)
+                self.assertIn("…", out)
+                self.assertIsNone(unclosed_fence(out))
 
     def test_human_comments_section_has_no_editorial_aside(self):
         gh = FakeGitHub(comments={"/repos/o/r/issues/42/comments": [

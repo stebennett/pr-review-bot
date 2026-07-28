@@ -766,6 +766,90 @@ def select(
 MAX_SOURCE_BYTES = 512 * 1024  # above this a file is generated or vendored, not reviewable
 BINARY_SNIFF_BYTES = 8 * 1024
 WINDOW_PAD = 60
+MAX_HIT_CHARS = 240  # a rendered grep hit line; see grep_repo
+
+
+# ── Truncation, in one place ─────────────────────────────────────────────────
+#
+# Every cut in the pack — a whole section against its budget, or one embedded
+# document against what is left of one — goes through this pair. Two properties
+# hold for all of them at once because there is only one implementation:
+# truncation is always marked in-band, and a cut never leaves a markdown fence
+# open.
+#
+# The second property is why this is shared rather than per-section. The pack is
+# concatenated ahead of the lens brief and LENS_TAIL (see build_lens_prompt), so
+# a fence left open by a cut does not merely spoil its own section: it swallows
+# everything after it — the remaining sections, the lens name, the brief, and
+# the tail's "every finding must anchor to a `path:line`" instruction — into one
+# quoted code block. A lens reading its own instructions as quoted content is
+# the worst failure this file can produce, and it used to be one budget and one
+# ordinary fenced PR body away.
+
+# A run of 3+ backticks alone on its line, optionally with an info string.
+# CommonMark: an opener may carry an info string, a closer may not, and a closer
+# must be at least as long as the opener it closes — so fences are tracked by
+# run length, never by counting occurrences.
+FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,})([^`]*)$")
+
+
+def _open_fence(text: str) -> str | None:
+    """The fence `text` leaves open, or None if every fence in it is closed.
+
+    A document's own longer fence must not be read as a closer for a shorter
+    one, which is exactly what a naive "count the ``` lines" check gets wrong —
+    and `_fence()` deliberately emits longer wrappers, so the pack is full of
+    them.
+    """
+    open_len = 0
+    for line in text.split("\n"):
+        m = FENCE_LINE_RE.match(line)
+        if m is None:
+            continue
+        run, info = len(m.group(1)), m.group(2).strip()
+        if open_len == 0:
+            open_len = run          # an opener may carry an info string
+        elif run >= open_len and not info:
+            open_len = 0
+    return "`" * open_len if open_len else None
+
+
+def truncation_markers(full: str | None = None) -> tuple[str, ...]:
+    """The in-band truncation ladder, most to least informative.
+
+    A caller with something specific to say passes it as `full`; every caller
+    then degrades through the same shorter forms, and finally to nothing at all
+    — which only a limit of 0 ever reaches, since "…" costs one character. This
+    is one ladder rather than the three near-copies it replaces.
+    """
+    return ((full,) if full else ()) + ("\n… truncated …\n", "…", "")
+
+
+def _capped(text: str, limit: int, markers: tuple[str, ...]) -> str:
+    """`text` cut to at most `limit` characters, marked, fence-balanced.
+
+    The cut decides which fence is open and closing that fence costs
+    characters, which moves the cut — so this iterates to a fixed point rather
+    than assuming one pass settles it. It terminates: every iteration that does
+    not return shrinks `body` strictly (the slice bound it takes is below the
+    length it just failed), and the empty string leaves nothing open.
+
+    The closing fence goes *before* the marker so the marker stays readable
+    prose rather than the last line of a quoted block, and the whole thing
+    still fits `limit` — a fence is never closed by overrunning the budget.
+    """
+    if limit <= 0:
+        return ""
+    marker = next(m for m in markers if len(m) <= limit)  # "" always qualifies
+    body = text[: limit - len(marker)]
+    while True:
+        fence = _open_fence(body)
+        if fence is None:
+            return body + marker
+        close = f"\n{fence}\n"
+        if len(body) + len(close) + len(marker) <= limit:
+            return body + close + marker
+        body = body[: max(0, limit - len(marker) - len(close))]
 
 
 def path_matches(path: str, patterns: list[str]) -> bool:
@@ -1307,6 +1391,14 @@ def walk_source(root: Path, cfg: dict):
         yield rel, data.decode("utf-8", "replace")
 
 
+def _clip_hit(line: str) -> str:
+    """One grep hit line, stripped and clipped to MAX_HIT_CHARS with a marker."""
+    line = line.strip()
+    if len(line) <= MAX_HIT_CHARS:
+        return line
+    return line[:MAX_HIT_CHARS] + " … (line clipped)"
+
+
 def grep_repo(
     root: Path, needles: list[str], cfg: dict, *, exclude: set[str], max_hits: int
 ) -> dict[str, list[tuple[str, int, str]]]:
@@ -1315,6 +1407,12 @@ def grep_repo(
     A needle exceeding SYMBOL_HIT_CEILING total matches is dropped entirely rather
     than sampled: a name that appears everywhere tells a reviewer nothing and would
     crowd out one that appears twice in the file that matters.
+
+    Each hit line is clipped to MAX_HIT_CHARS. `walk_source` admits any
+    code-suffixed file up to MAX_SOURCE_BYTES, and a minified or generated `.js`
+    is one line half a megabyte long — a single such hit would spend the whole
+    call-sites budget by itself, and no reviewer could read it anyway. The clip
+    is marked so the line is not mistaken for the whole of it.
     """
     if not needles:
         return {}
@@ -1328,7 +1426,7 @@ def grep_repo(
                 if needle in line:
                     counts[needle] += 1
                     if len(hits[needle]) < max_hits:
-                        hits[needle].append((rel, lineno, line.strip()))
+                        hits[needle].append((rel, lineno, _clip_hit(line)))
     return {n: h for n, h in hits.items() if h and counts[n] <= SYMBOL_HIT_CEILING}
 
 
@@ -1405,20 +1503,19 @@ def _fence(text: str) -> str:
 
 
 def _truncate_inline(text: str, limit: int) -> str:
-    """`text` cut to at most `limit` characters, with an in-band marker.
+    """One embedded document cut to at most `limit` characters, marked in band.
 
-    A document-scale echo of `Accounting.add`'s own degrade-in-stages
-    approach: the marker is shortened, and finally dropped altogether, only
-    when `limit` is too small to hold it. Used instead of a bare `text[:limit]`
-    so a truncated document still visibly says so, exactly like a truncated
-    section does.
+    The same `_capped` every section budget goes through, on the same marker
+    ladder — a document-scale echo of `Accounting.add`. Used instead of a bare
+    `text[:limit]` so a truncated document still visibly says so, exactly like
+    a truncated section does.
+
+    The caller wraps the result in a `_fence()` longer than any run in the
+    *whole* document, so no cut here can close that wrapper; the fence
+    balancing `_capped` does inside the cut costs nothing and keeps the
+    property unconditional rather than conditional on that wrapper.
     """
-    if limit <= 0:
-        return ""
-    for marker in ("\n… truncated …\n", "…", ""):
-        if len(marker) <= limit:
-            return text[: limit - len(marker)] + marker
-    return ""  # unreachable: "" always satisfies len(marker) <= limit
+    return _capped(text, limit, truncation_markers())
 
 
 def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]], acc: "Accounting") -> str:
@@ -1548,10 +1645,8 @@ def pack_conventions(root: Path | None, ranges: dict[str, list[tuple[int, int]]]
         # trace at all without this: a trailing, unfenced note, sized to
         # whatever budget remains after the last block that did fit.
         room = budget - len(text_out)
-        for marker in (
-            f"\n… truncated: conventions exceeded its {budget}-character budget …\n",
-            "\n… truncated …\n", "…", "",
-        ):
+        full = f"\n… truncated: conventions exceeded its {budget}-character budget …\n"
+        for marker in truncation_markers(full):
             if len(marker) <= room:
                 text_out += marker
                 break
@@ -1707,19 +1802,17 @@ class Accounting:
             self.used[part] = len(text)
             return text
         self.truncated.add(part)
-        # The marker itself costs characters, so at a small enough limit even
-        # the short marker cannot fit — tried in order from most to least
-        # informative: full sentence, short phrase, a bare ellipsis, and only
-        # at limit 0 (which cannot hold even one character) nothing at all.
-        # Every limit >= 1 must carry *some* in-band signal that truncation
-        # happened, per this class's own contract above.
+        # `_capped` owns both halves of this: the marker ladder (the marker
+        # itself costs characters, so at a small enough limit it shrinks and
+        # finally disappears — only at limit 0, which cannot hold even one
+        # character, per this class's contract above) and the guarantee that a
+        # section handed here fenced does not go back out with its fence open.
+        # Sections that fence their content — call sites, the path tree, an
+        # embedded conventions document, every changed-file body — all arrive
+        # through this one method, so they are all covered by that guarantee at
+        # once rather than each carrying its own fence arithmetic.
         full = f"\n\n… truncated: {part} exceeded its {limit}-character budget …\n"
-        short = "\n… truncated …\n"
-        minimal = "…"
-        for marker in (full, short, minimal, ""):
-            if len(marker) <= limit:
-                break
-        out = text[: limit - len(marker)] + marker
+        out = _capped(text, limit, truncation_markers(full))
         self.used[part] = len(out)
         return out
 
