@@ -2024,6 +2024,18 @@ def build_context(
 
     Never raises on a pack failure: a review with a thin pack is worth far more
     than no review, so every path here degrades and records why in `notes`.
+
+    That guarantee covers *acquiring* the checkout, not just packing it. It used
+    to start at the pack-assembly `try` and leave everything above it bare, which
+    made the failures most likely in the real deployment the ones that were not
+    covered: `tempfile.TemporaryDirectory` raising OSError on a pod with a
+    read-only root filesystem or a full disk failed every review of every pass,
+    and so did a `max_tarball_bytes` missing from a repo's config. Both are
+    exactly the "thin pack beats no review" case the guarantee exists for.
+
+    `yield ctx` is deliberately *outside* the guard: an exception the caller's
+    `with` body raises arrives here at the yield, and swallowing that would
+    silently discard a failed review rather than degrade a pack.
     """
     ctx = Context(pr.get("body") or "(none stated — judge against the PR title alone)")
     if not enabled:
@@ -2033,30 +2045,30 @@ def build_context(
 
     tmp: tempfile.TemporaryDirectory | None = None
     try:
-        if worktree:
-            root = Path(worktree).expanduser().resolve()
-            ctx.root = root if root.is_dir() else None
-            if ctx.root is None:
-                ctx.notes.append(f"--worktree {worktree} is not a directory")
-        elif gh is not None:
-            tmp = tempfile.TemporaryDirectory(prefix="pr-reviewer-")
-            head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name") or repo
-            ctx.root = fetch_checkout(
-                gh, head_repo, pr["head"]["sha"], Path(tmp.name), cfg["max_tarball_bytes"]
-            )
-            if ctx.root is None:
-                ctx.notes.append("no checkout; changed files fetched per-file")
-        else:
-            ctx.notes.append("no checkout available (offline without --worktree)")
-
-        if ctx.root is not None and not _checkout_matches_diff(ctx.root, diff):
-            ctx.notes.append(
-                f"checkout at {ctx.root} matches none of the diff's pre-existing changed "
-                "paths; treating as no checkout"
-            )
-            ctx.root = None
-
         try:
+            if worktree:
+                root = Path(worktree).expanduser().resolve()
+                ctx.root = root if root.is_dir() else None
+                if ctx.root is None:
+                    ctx.notes.append(f"--worktree {worktree} is not a directory")
+            elif gh is not None:
+                tmp = tempfile.TemporaryDirectory(prefix="pr-reviewer-")
+                head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name") or repo
+                ctx.root = fetch_checkout(
+                    gh, head_repo, pr["head"]["sha"], Path(tmp.name), cfg["max_tarball_bytes"]
+                )
+                if ctx.root is None:
+                    ctx.notes.append("no checkout; changed files fetched per-file")
+            else:
+                ctx.notes.append("no checkout available (offline without --worktree)")
+
+            if ctx.root is not None and not _checkout_matches_diff(ctx.root, diff):
+                ctx.notes.append(
+                    f"checkout at {ctx.root} matches none of the diff's pre-existing changed "
+                    "paths; treating as no checkout"
+                )
+                ctx.root = None
+
             acc = Accounting(budgets(cfg["max_context_chars"]))
             ctx.requirements = resolve_requirements(gh, repo, pr, acc)
             sections: list[str] = []
@@ -2068,13 +2080,15 @@ def build_context(
             sections.append(pack_tree(ctx.root, ranges, cfg, acc))
             ctx.pack = "\n".join(s for s in sections if s)
             acc.report()
-        except Exception as exc:  # noqa: BLE001 - a bad config must degrade the pack, never the review
+        except Exception as exc:  # noqa: BLE001 - anything here degrades the pack, never the review
             ctx.notes.append(f"context assembly failed ({exc}); pack left empty")
+            ctx.pack, ctx.root = "", None
 
         for note in ctx.notes:
             log(f"    context note: {note}")
         yield ctx
     finally:
+        # `tmp` is still None when TemporaryDirectory itself was what failed.
         if tmp is not None:
             tmp.cleanup()
 

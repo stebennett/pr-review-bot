@@ -243,6 +243,81 @@ class TestBuildContext(unittest.TestCase):
             after = set(system_tmp.glob("pr-reviewer-*"))
             self.assertEqual(before, after)
 
+    def test_a_read_only_filesystem_degrades_rather_than_failing_the_review(self):
+        # I1: the never-fail-a-review guarantee used to begin at the pack
+        # assembly `try`, leaving the checkout acquisition above it bare — so a
+        # hardened pod with a read-only root filesystem, or a full disk, failed
+        # *every* review of every pass rather than reviewing with a thin pack.
+        def refuse(*a, **k):
+            raise OSError(30, "Read-only file system")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = make_archive(
+                pathlib.Path(tmp), "owner-repo-abc123de", {"src/foo.py": "print(1)\n"})
+            gh = _FakeGH(archive)
+            real = tempfile.TemporaryDirectory
+            tempfile.TemporaryDirectory = refuse
+            try:
+                with review.build_context(
+                    gh, "owner/repo", self._pr(), "", dict(review.DEFAULTS), enabled=True
+                ) as ctx:
+                    pass
+            finally:
+                tempfile.TemporaryDirectory = real
+
+        self.assertEqual(ctx.pack, "")
+        self.assertIsNone(ctx.root)
+        self.assertTrue(
+            any("Read-only file system" in note for note in ctx.notes),
+            f"expected the real reason in the notes, got {ctx.notes!r}",
+        )
+
+    def test_a_config_missing_max_tarball_bytes_degrades_rather_than_raising(self):
+        # Reproduced separately from max_context_chars: this KeyError is raised
+        # above the old guard, the other below it.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = make_archive(
+                pathlib.Path(tmp), "owner-repo-abc123de", {"src/foo.py": "print(1)\n"})
+            cfg = dict(review.DEFAULTS)
+            del cfg["max_tarball_bytes"]
+            with review.build_context(
+                _FakeGH(archive), "owner/repo", self._pr(), "", cfg, enabled=True
+            ) as ctx:
+                pass
+        self.assertEqual(ctx.pack, "")
+        self.assertTrue(any("context assembly failed" in n for n in ctx.notes), ctx.notes)
+
+    def test_a_checkout_validity_check_that_raises_still_yields_a_context(self):
+        # The third unguarded call: _checkout_matches_diff walks the diff and
+        # touches the filesystem, and either can raise.
+        def boom(root, diff):
+            raise OSError("stat failed")
+
+        real = review._checkout_matches_diff
+        review._checkout_matches_diff = boom
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with review.build_context(
+                    None, "o/r", self._pr(), "", dict(review.DEFAULTS),
+                    enabled=True, worktree=tmp,
+                ) as ctx:
+                    pass
+        finally:
+            review._checkout_matches_diff = real
+        self.assertEqual(ctx.pack, "")
+        self.assertTrue(any("stat failed" in n for n in ctx.notes), ctx.notes)
+
+    def test_a_body_exception_is_never_swallowed_by_the_pack_guard(self):
+        # The guard stops at `yield ctx` on purpose: widening it over the yield
+        # would turn a failed review into a context note and a clean exit.
+        with self.assertRaises(RuntimeError):
+            with tempfile.TemporaryDirectory() as tmp:
+                with review.build_context(
+                    None, "o/r", self._pr(), "", dict(review.DEFAULTS),
+                    enabled=True, worktree=tmp,
+                ):
+                    raise RuntimeError("the review itself failed")
+
     def test_context_disabled_yields_an_empty_pack_with_exactly_one_note(self):
         # Nothing else in this suite exercises build_context/Context directly;
         # this is the cheapest path through it (no checkout, no accounting).
