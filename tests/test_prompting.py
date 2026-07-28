@@ -1,5 +1,7 @@
 """Prompt assembly and dispatch. No network: nothing here calls a model."""
 
+import argparse
+import os
 import pathlib
 import sys
 import threading
@@ -161,6 +163,208 @@ class TestLensPromptBlocks(unittest.TestCase):
     def test_an_absent_pack_leaves_no_dangling_heading(self):
         _, user = self.build("craft", pack="")
         self.assertNotIn("## Context", user[0]["text"])
+
+    def test_the_deployment_tail_is_present_in_the_assembled_prompt(self):
+        # Deleting LENS_TAIL from the prompt entirely was a green mutation. It is
+        # what tells a lens it has no tools, that an absent section is code it
+        # has not seen, and that every finding must anchor to a diff line — none
+        # of which the upstream doctrine says, because upstream had a worktree.
+        for lens in review.LENSES:
+            with self.subTest(lens=lens):
+                system, user = self.build(lens)
+                assembled = "".join(b["text"] for b in system + user)
+                self.assertIn(review.LENS_TAIL, assembled)
+
+    def test_the_porting_note_precedes_the_doctrine_it_overrides(self):
+        # Asserting each file is present with two assertIns leaves swapping them
+        # green, and the order is the point: agents/pr-review-lens.md opens with
+        # the porting note that overrides the doctrine below it (no tools, no
+        # worktree, no merging — see CLAUDE.md). Doctrine first would mean the
+        # lens reads the overridden rules as final.
+        system, _ = self.build("craft")
+        text = system[0]["text"]
+        self.assertLess(
+            text.index(review.DOC("agents/pr-review-lens.md")),
+            text.index(review.DOC("lenses/_shared.md")),
+            "the porting note must come before the doctrine it overrides",
+        )
+
+
+def flat(content) -> str:
+    """A prompt argument as text: openrouter takes either a string or blocks."""
+    return content if isinstance(content, str) else "".join(b["text"] for b in content)
+class TestAdjudicatePrompt(unittest.TestCase):
+    """The branch's most load-bearing structural invariant: the adjudicator sees
+    the lens envelopes, the PR body, the prior review body and the resolved
+    requirements — never the diff, never ctx.pack (see CLAUDE.md and
+    doctrine/agents/pr-review-verdict.md). adjudicate() appeared in no test at
+    all, so appending the diff to its user message was a green mutation."""
+
+    DIFF_TOKEN = "SENTINEL_ONLY_IN_THE_DIFF"
+    PACK_TOKEN = "SENTINEL_ONLY_IN_THE_PACK"
+
+    @classmethod
+    def setUpClass(cls):
+        review.DOC = review.Doctrine(
+            pathlib.Path(review.__file__).resolve().parent / "doctrine")
+
+    def pr(self):
+        return dict(PR, body="the PR body itself",
+                    _prior_body="what round 1 recommended", _rounds=1)
+
+    def capture(self):
+        """adjudicate() with the model call stubbed out, returning its prompt."""
+        seen = {}
+
+        def fake(model, system, user, schema, label=None):
+            seen["model"] = model
+            seen["system"] = flat(system)
+            seen["user"] = flat(user)
+            return {"verdict": "approve"}
+
+        real, review.openrouter = review.openrouter, fake
+        try:
+            review.adjudicate(
+                self.pr(), "o/r",
+                [{"lens": "craft", "findings": [{"note": "a lens said this"}]}],
+                "the resolved requirements", "some/model",
+            )
+        finally:
+            review.openrouter = real
+        return seen
+
+    def test_the_four_things_it_must_see_are_all_in_its_user_message(self):
+        user = self.capture()["user"]
+        self.assertIn("a lens said this", user)                     # lens envelopes
+        self.assertIn("the PR body itself", user)                   # PR body
+        self.assertIn("what round 1 recommended", user)             # prior review body
+        self.assertIn("the resolved requirements", user)            # resolved requirements
+
+    def test_its_user_message_carries_exactly_these_sections_and_no_others(self):
+        # An exact heading set, not four assertIns: a "## Diff" section added
+        # here is the whole failure this invariant exists to prevent, and only
+        # an exact set notices a new one.
+        user = self.capture()["user"]
+        self.assertEqual(
+            [ln for ln in user.splitlines() if ln.startswith("## ")],
+            ["## PR body", "## Resolved requirements",
+             "## Prior recommendations", "## Lens envelopes"],
+        )
+
+    def test_neither_the_diff_nor_the_pack_reaches_the_verdict_prompt(self):
+        # Asserted through run_panel, where a real diff and a real pack are both
+        # in scope — the only place a future "helpful" change could pass either
+        # one down, whatever route it took to get there.
+        prompts = []
+
+        def fake(model, system, user, schema, label=None):
+            prompts.append((label, flat(system) + flat(user)))
+            if label == "verdict":
+                return {"verdict": "approve", "blocker_count": 0,
+                        "body": "<!-- pr-reviewer: verdict=approve round=2 sha=abc1234 -->\nok"}
+            return {"lens": label.split(":")[1], "status": "ok", "findings": []}
+
+        diff = DIFF.replace("import sys", f"import sys  # {self.DIFF_TOKEN}")
+        ctx = review.Context("the resolved requirements")
+        ctx.pack = f"## Changed files at head\n{self.PACK_TOKEN}\n"
+        opts = argparse.Namespace(lens=None, model_lens="m/lens",
+                                  model_verdict="m/verdict", save=None)
+
+        real, review.openrouter = review.openrouter, fake
+        try:
+            verdict = review.run_panel(self.pr(), "o/r", diff, ctx, opts)
+        finally:
+            review.openrouter = real
+
+        self.assertEqual(verdict["verdict"], "approve")
+        sent = dict(prompts)
+        self.assertIn(self.DIFF_TOKEN, sent["lens:craft"])          # the lenses do see both
+        self.assertIn(self.PACK_TOKEN, sent["lens:craft"])
+        self.assertNotIn(self.DIFF_TOKEN, sent["verdict"])          # the adjudicator sees neither
+        self.assertNotIn(self.PACK_TOKEN, sent["verdict"])
+
+    def test_the_marker_contract_and_the_round_number_are_stated(self):
+        user = self.capture()["user"]
+        self.assertIn("<!-- pr-reviewer: verdict=", user)
+        self.assertIn("round=2", user)                              # _rounds 1 -> round 2
+        self.assertIn(PR["head"]["sha"][:7], user)
+
+    def test_the_verdict_doctrine_is_the_system_prompt(self):
+        seen = self.capture()
+        self.assertIn(review.DOC("agents/pr-review-verdict.md"), seen["system"])
+        self.assertIn(review.DOC("verdict.md"), seen["system"])
+
+    def test_the_verdict_model_is_the_one_it_was_given(self):
+        # Each model call names its own model so a cheap model reviews and a
+        # stronger one adjudicates (CLAUDE.md); collapsing that is a real risk.
+        self.assertEqual(self.capture()["model"], "some/model")
+
+
+class TestResolvePost(unittest.TestCase):
+    """Posting requires an explicit opt-in and --dry-run always wins."""
+
+    def opts(self, **kw):
+        return argparse.Namespace(**{"dry_run": False, "post": False, **kw})
+
+    def setUp(self):
+        self.before = os.environ.get("DRY_RUN")
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        if self.before is None:
+            os.environ.pop("DRY_RUN", None)
+        else:
+            os.environ["DRY_RUN"] = self.before
+
+    def test_dry_run_beats_post(self):
+        os.environ.pop("DRY_RUN", None)
+        self.assertFalse(review.resolve_post(self.opts(dry_run=True, post=True)))
+
+    def test_an_unset_dry_run_env_does_not_post(self):
+        os.environ.pop("DRY_RUN", None)
+        self.assertFalse(review.resolve_post(self.opts()))
+
+    def test_post_alone_posts(self):
+        os.environ.pop("DRY_RUN", None)
+        self.assertTrue(review.resolve_post(self.opts(post=True)))
+
+    def test_dry_run_zero_in_the_env_posts(self):
+        os.environ["DRY_RUN"] = "0"
+        self.assertTrue(review.resolve_post(self.opts()))
+
+    def test_dry_run_one_in_the_env_does_not_post(self):
+        os.environ["DRY_RUN"] = "1"
+        self.assertFalse(review.resolve_post(self.opts()))
+
+    def test_dry_run_beats_a_posting_env(self):
+        os.environ["DRY_RUN"] = "0"
+        self.assertFalse(review.resolve_post(self.opts(dry_run=True)))
+
+    def test_an_unrecognised_dry_run_value_does_not_post(self):
+        # Posting is opt-in, so the allow-list is of the values that mean "post"
+        # — never a deny-list of the ones that mean "don't". A typo in the
+        # CronJob's env must fail safe.
+        for value in ("", " ", "maybe", "off", "2"):
+            with self.subTest(value=value):
+                os.environ["DRY_RUN"] = value
+                self.assertFalse(review.resolve_post(self.opts()))
+
+
+class TestResolveCache(unittest.TestCase):
+    """The CLI wins, so --no-cache is always an effective escape hatch."""
+
+    def test_no_cache_beats_a_repo_config_asking_for_caching(self):
+        opts = argparse.Namespace(no_cache=True)
+        self.assertFalse(review.resolve_cache(opts, {"cache": True}))
+
+    def test_a_repo_can_turn_caching_off(self):
+        opts = argparse.Namespace(no_cache=False)
+        self.assertFalse(review.resolve_cache(opts, {"cache": False}))
+
+    def test_caching_is_on_by_default(self):
+        opts = argparse.Namespace(no_cache=False)
+        self.assertTrue(review.resolve_cache(opts, None))
+        self.assertTrue(review.resolve_cache(opts, {}))
 
 
 class TestDispatchLenses(unittest.TestCase):
