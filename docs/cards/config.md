@@ -40,6 +40,7 @@ size_exclude:
   - "vendor/**"
   - "node_modules/**"
   - "docs/cards/**"
+  - "tests/goldens/**"
 layers:
   - infra
   - core

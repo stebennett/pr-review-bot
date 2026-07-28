@@ -83,6 +83,11 @@ this codebase rather than general architecture preference:
 
 ## Architecture
 
+### REQ-001 — Ports-and-adapters module layout
+**Status:** active
+
+The package is laid out as:
+
 ```
 review.py                         # 3-line shim -> reviewer.app.cli:main
 reviewer/
@@ -123,6 +128,9 @@ reviewer/
     cli.py             ~150   build_parser, resolve_post, resolve_cache, main
 ```
 
+### REQ-002 — `review.py` remains a root-level shim
+**Status:** active
+
 `review.py` remains at the repository root as a three-line shim. Every command in `CLAUDE.md`
 and `README.md` keeps working verbatim, and the container entrypoint stays `/app/review.py`,
 so the eventual `home-lab-k8s` change is a volume swap with no `command:` edit.
@@ -133,7 +141,8 @@ Three, in `reviewer/ports.py`, defined as `typing.Protocol`. Each exists because
 than one real implementation or is a seam a test genuinely needs. No port is introduced
 speculatively.
 
-### `SourceTree`
+### REQ-003 — `SourceTree` port and its four implementations
+**Status:** active
 
 ```python
 class SourceTree(Protocol):
@@ -153,7 +162,10 @@ being branching and become implementations:
 | per-file API fallback | `root=None` plus `gh` threaded down | `ApiTree` |
 | nothing available | `root=None`, `gh=None` | `EmptyTree` |
 
-Every `pack_*` assembler then takes a `SourceTree` and is pure with respect to it. Three
+### REQ-004 — Pack assemblers are pure with respect to a `SourceTree`
+**Status:** active
+
+Every `pack_*` assembler takes a `SourceTree` and is pure with respect to it. Three
 consequences follow directly:
 
 - The assemblers are testable with an in-memory dict instead of a temp directory.
@@ -163,7 +175,8 @@ consequences follow directly:
   `walk()`/`grep()` with emptiness, which is exactly the documented degradation — and the pack
   states in-band what is missing, so a lens does not read absence as evidence.
 
-### `ModelClient`
+### REQ-005 — `ModelClient` port
+**Status:** active
 
 ```python
 class ModelClient(Protocol):
@@ -174,7 +187,8 @@ One production implementation. It exists as the seam that lets `app/panel.py`'s 
 dispatch, retry ladder and consistency enforcement be tested without a network and without
 cost — today none of that logic can be exercised without spending money.
 
-### `IssueSource`
+### REQ-006 — `IssueSource` port
+**Status:** active
 
 ```python
 class IssueSource(Protocol):
@@ -189,7 +203,10 @@ write side deliberately: nothing on the requirements path should be able to post
 
 The existing invariants are preserved. Three of them stop depending on care.
 
-**The byte-identical cache prefix.** Blocks 1 and 2 of the lens prompt must be identical across
+### REQ-007 — The byte-identical cache prefix is structurally enforced
+**Status:** active
+
+Blocks 1 and 2 of the lens prompt must be identical across
 the three lenses, and the failure is silent — nothing breaks, the cost doubles. Today a test
 asserts this. Instead, `core/prompt.py` splits the builder so that
 
@@ -202,12 +219,18 @@ The shared builder has no `lens` argument, so lens-dependence in the cached pref
 merely detected — it cannot be expressed. The existing assertion in `tests/test_prompting.py`
 stays as a second line of defence.
 
-**The adjudicator never sees the diff or the pack.** `build_verdict_prompt(pr, requirements,
-envelopes, prior_review)` has no parameter capable of carrying either, and lives in a module
-that does not import the pack types. The mutation tests added for finding I4 — which caught
-appending both the diff and the pack via `run_panel` — carry over unchanged.
+### REQ-008 — The adjudicator never sees the diff or the pack
+**Status:** active
 
-**Layer boundaries.** A test walks the AST of every module and asserts:
+`build_verdict_prompt(pr, requirements, envelopes, prior_review)` has no parameter capable of
+carrying either, and lives in a module that does not import the pack types. The mutation tests
+added for finding I4 — which caught appending both the diff and the pack via `run_panel` —
+carry over unchanged.
+
+### REQ-009 — Layer boundaries are enforced by an import test
+**Status:** active
+
+A test walks the AST of every module and asserts:
 
 - `reviewer/core/**` imports only the standard library, `reviewer.ports`, `reviewer.config`,
   and other `reviewer.core` modules;
@@ -218,25 +241,42 @@ appending both the diff and the pack via `run_panel` — carry over unchanged.
 resolution over a dict; `.env` loading — the one side effect it performs today — moves to
 `adapters/env.py`.
 
-**The core does not log.** Writing to stderr is a side effect, and `vlog` is currently called
-from inside pack assemblers, which is the same leak in a smaller form. Diagnostics from core
-travel back as data: `Accounting` already collects per-section budget usage and truncation
-notes, and `ctx.notes` already carries degradation reasons. `app/` emits them. This also fixes
-a real defect the ledger recorded as out of scope — `resolve_requirements` and
-`extract_checkout` report failures through `vlog()`, so a thinned requirements string or a
-failed checkout is invisible without `-v`. Once those are notes rather than log lines, the
-caller decides how loud they are.
-
 This is what keeps the "pure core" claim true over time. It also preserves the old
 standard-library-only rule precisely where it still has value — the core stays dependency-free
 and portable — while the edges are free to use libraries.
 
-**`_capped` remains the single cut point** for pack content. `core/budget.py` is the only module
+### REQ-010 — The core does not log
+**Status:** active
+
+Writing to stderr is a side effect. Exactly three call sites leak it into what becomes the pure
+core: `Accounting.report()` calls `log()` at `review.py:1868`, and `resolve_requirements` calls
+`vlog()` at `review.py:1992` and `:2002`. No `pack_*` assembler logs at all — verified against
+the source, and the narrowness is what makes the fix cheap.
+
+Diagnostics from core travel back as data instead: `Accounting` already collects per-section
+budget usage and truncation notes, and `ctx.notes` already carries degradation reasons. `app/`
+emits them. This also fixes a real defect the ledger recorded as out of scope — a thinned
+requirements string is invisible without `-v`. Once those are notes rather than log lines, the
+caller decides how loud they are.
+
+`extract_checkout` is already correct and needs no change: it uses `log()` deliberately, for the
+reason recorded in the comment at `review.py:1910`.
+
+Because the import boundary of REQ-009 forbids `core/` importing `reviewer.log`, this obligation
+is discharged by whichever change moves each offending function into `core/`, not afterwards.
+
+### REQ-011 — `_capped` remains the single cut point for pack content
+**Status:** active
+
+`core/budget.py` is the only module
 containing truncation logic; assemblers never slice strings themselves. The 10,060-case sweep
 over every integer budget carries over unchanged, as does the rule that a fifth per-section
 cutter is never added.
 
-**Unchanged and restated:** only four steps call a model; each model call names its own model;
+### REQ-012 — The existing behavioural invariants are preserved unchanged
+**Status:** active
+
+Unchanged and restated: only four steps call a model; each model call names its own model;
 there is no state anywhere beyond the marker; drafts and Renovate-authored PRs are never
 reviewed; posting requires explicit opt-in; `tarfile`'s `filter="data"` is load-bearing on the
 3.13 target; one failing PR must not abort a pass; v1 is review-only.
@@ -247,7 +287,8 @@ The standard-library-only rule existed because the ConfigMap deployment has no i
 container has one, so the rule is relaxed at the edges and retained in the core by the import
 test above.
 
-**Adopted:**
+### REQ-013 — Adopt githubkit, httpx, PyJWT and pytest
+**Status:** active
 
 | Dependency | Replaces | Why |
 |---|---|---|
@@ -255,6 +296,13 @@ test above.
 | `httpx` | `_http` (`review.py:246`) | Real timeouts, retries, connection pooling; `githubkit` is built on it |
 | `PyJWT` + `cryptography` | `_app_jwt` (`review.py:161-195`) | Removes an `openssl` **subprocess** and hand-rolled base64url/PKCS1 handling |
 | `pytest` (dev only) | `unittest` runner | Runs the existing 263 `unittest` classes unchanged, so migration is additive |
+
+`_http` is replaced everywhere it is called, including at `review.py:492` inside
+`openrouter()`'s retry ladder. REQ-016 governs how that particular call is verified, not whether
+it changes.
+
+### REQ-014 — The `openssl` shell-out is deleted
+**Status:** active
 
 Because `githubkit` performs App authentication itself using `PyJWT`, `adapters/auth.py` shrinks
 to credential resolution and configuration rather than crypto. The `openssl` shell-out — a
@@ -266,18 +314,38 @@ happens later. Stage 4c may then delegate the same work to `githubkit`'s own ins
 strategy, superseding most of 4a's code. That is expected, not waste: 4a removes the shell-out
 immediately and independently of whether the client swap survives its verification.
 
+### REQ-015 — The GitHub client choice is confirmed against the real API surface
+**Status:** active
+
 `githubkit` is the intended client, confirmed against the real API surface at Stage 4c. If GitHub
 App installation auth or the 422 inline-comment fallback does not map cleanly onto it, the
 fallback is `PyGithub`; if neither maps cleanly, the hand-rolled calls stay on `httpx` and the
 stage is dropped. This is a decision with a documented trigger, not an open question.
 
-**Deliberately not adopted: the OpenRouter client.** `adapters/openrouter.py` stays hand-rolled,
-byte-for-byte, and is the one module this refactor may relocate but must not rewrite. Its 240
-lines carry the `cache_control` content-block structure, `provider: {"require_parameters": true}`,
-the three-attempt retry ladder and `cached_tokens` logging. That is the machinery behind the
-measured 0.93x cost figure, and it fails silently: a wrong request shape does not error, it
-simply stops caching and doubles the bill. Routing it through an SDK would put a library's
-serialisation between the deployment and an invariant that was measured rather than assumed.
+### REQ-016 — `adapters/openrouter.py` is ported under a cache-measurement gate
+**Status:** active
+
+`adapters/openrouter.py` carries the `cache_control` content-block structure,
+`provider: {"require_parameters": true}`, the three-attempt retry ladder and `cached_tokens`
+logging. That is the machinery behind the measured 0.93x cost figure, and it fails silently: a
+wrong request shape does not error, it simply stops caching and doubles the bill.
+
+It is therefore ported to `httpx` deliberately rather than exempted from REQ-013, and the port
+is gated on **measurement rather than inspection**. The gate: a live run against the real
+OpenRouter API reports non-zero `cached_tokens` on the second and third lens calls, consistent
+with the 91% cache-read figure Gate 1 recorded. The port does not land until that measurement
+passes. Because OpenRouter routes the same model to different providers call to call, a single
+zero reading proves nothing and is re-run before it is believed.
+
+The OpenAI SDK is still not adopted: the port replaces the transport call and its exception
+type, and nothing else. The retry ladder's branching behaviour — three attempts on the same
+status codes as today — is preserved and pinned by a test.
+
+This is the one verification in this design that cannot be hermetic, and therefore the one that
+is never a CI job (REQ-028).
+
+### REQ-017 — Runtime and development dependencies are separated and pinned
+**Status:** active
 
 Runtime dependencies are pinned in `requirements.txt`; `requirements-dev.txt` holds `pytest` and
 never enters the image.
@@ -285,6 +353,13 @@ never enters the image.
 ## Deployment
 
 Confined to this repository. The `home-lab-k8s` change is the user's, made later.
+
+The cluster already runs `ghcr.io/stebennett/slack-invite-mgr-{web,backend}:2.0.2`, built by
+that repository's own `release.yml`, with Renovate already watching image tags in
+`home-lab-k8s`. This follows an established pattern rather than introducing one.
+
+### REQ-018 — A container image and its build pipeline are defined in this repository
+**Status:** active
 
 ```
 Dockerfile              python:3.13-slim; pip install -r requirements.txt;
@@ -297,23 +372,49 @@ requirements-dev.txt    pytest; never shipped
 .github/workflows/release.yml  build and push ghcr.io/stebennett/pr-review-bot:X.Y.Z
 ```
 
-The cluster already runs `ghcr.io/stebennett/slack-invite-mgr-{web,backend}:2.0.2`, built by
-that repository's own `release.yml`, with Renovate already watching image tags in
-`home-lab-k8s`. This follows an established pattern rather than introducing one.
-
-Three deliberate choices:
-
-- **The entrypoint stays `/app/review.py`**, so `cronjob.yaml`'s `command:` needs no edit — the
-  eventual change is swapping a ConfigMap volume for an `image:`.
-- **`doctrine/` is baked into the image.** That removes all seven doctrine entries from both
-  YAML lists, so the deployment change is a net simplification rather than a lateral move.
-- **Bytecode is precompiled at build time** with `compileall`. The pod runs with
-  `readOnlyRootFilesystem: true` and mounts at `defaultMode: 0555`, so nothing can write
-  `__pycache__` at runtime.
-
 `.env` remains a local convenience and is not in the image; the container reads the same
 environment variables from the existing secrets. `.claude/pr-reviewer.json` lives in the
 *target* repository and is untouched.
+
+### REQ-019 — The container entrypoint stays `/app/review.py`
+**Status:** active
+
+The entrypoint stays `/app/review.py`, so `cronjob.yaml`'s `command:` needs no edit — the
+eventual change is swapping a ConfigMap volume for an `image:`.
+
+### REQ-020 — `doctrine/` is baked into the image
+**Status:** active
+
+`doctrine/` is baked into the image. That removes all seven doctrine entries from both
+YAML lists, so the deployment change is a net simplification rather than a lateral move.
+
+### REQ-021 — Bytecode is precompiled at build time
+**Status:** active
+
+Bytecode is precompiled at build time with `compileall`. The pod runs with
+`readOnlyRootFilesystem: true` and mounts at `defaultMode: 0555`, so nothing can write
+`__pycache__` at runtime.
+
+### REQ-028 — Continuous integration runs only against stubbed endpoints
+**Status:** active
+
+No workflow may require live credentials or spend money, so CI never reaches the real GitHub or
+OpenRouter. `GITHUB_API` and `OPENROUTER_API` — module constants at `review.py:56-57` with seven
+call sites between them — default from the environment, and CI points them at a local stub
+server serving canned responses.
+
+Stubbing at the **transport boundary** rather than by injecting in-process fakes is deliberate:
+it keeps the real HTTP client, the real auth path and the real retry ladder under test, which is
+the only thing that makes an image smoke-test worth running at all. A GitHub App JWT is verified
+against a key pair generated inside the test rather than against GitHub, which is a stricter
+assertion than a live call — it can check `iss`, `iat`, `exp` and `alg`, where a live call only
+proves the token was accepted.
+
+The existing 263 tests already satisfy this: none opens a connection. The obligation binds the
+new work — the image smoke-test, the auth port, and the 422 inline-comment fallback.
+
+REQ-016's cache measurement is the sole exemption. It is inherently live, so it is a manual,
+recorded verification and never a CI job.
 
 ## Verification
 
@@ -321,7 +422,10 @@ The 263 tests are the obvious safety net, but the dependency swaps force some of
 — so the net moves while the code moves. The net therefore has to be anchored to something that
 survives both.
 
-**Golden prompt bytes.** For a refactor, pinning the assembled prompt bytes is a stronger claim
+### REQ-022 — Golden prompt bytes pin the refactor
+**Status:** active
+
+For a refactor, pinning the assembled prompt bytes is a stronger claim
 than pinning the findings: findings are stochastic, prompt bytes are not, and identical bytes
 mean identical model behaviour by construction. Prompt assembly and `build_context` both run
 entirely offline, so this net costs **zero model calls and no money**.
@@ -335,15 +439,24 @@ Captured per fixture diff and configuration, byte-for-byte:
 The harness regenerates these and compares against committed goldens. It is framework-independent
 — plain files on disk — so it survives the `pytest` and `httpx` migrations intact.
 
-**Fixtures are synthetic, committed and self-contained.** A set of diffs and a small source tree
+### REQ-023 — Fixtures are synthetic, committed and self-contained
+**Status:** active
+
+A set of diffs and a small source tree
 constructed to stress the parts that matter: one that fills the changed-files budget, one that
 forces hunk windowing, one that forces the dropped-file trailer, one carrying adversarial
 backtick fences, one that adds only new files. No fixture depends on a checkout existing on a
 particular machine; that fragility is part of what this work removes.
 
-**Two new structural tests:** the golden comparison above, and the import-boundary AST check.
+### REQ-024 — Two new structural tests ship with the refactor
+**Status:** active
 
-**Test layout** mirrors the source. `tests/test_context.py` is 2,304 lines and is split into
+Two new structural tests: the golden comparison above, and the import-boundary AST check.
+
+### REQ-025 — The test layout mirrors the source, with two fakes
+**Status:** active
+
+Test layout mirrors the source. `tests/test_context.py` is 2,304 lines and is split into
 `tests/core/`, `tests/adapters/` and `tests/app/`. Two fakes replace most existing scaffolding:
 `InMemoryTree` (a dict of path to content, implementing `SourceTree`) and `RecordingModelClient`
 (implementing `ModelClient`).
@@ -351,7 +464,8 @@ particular machine; that fragility is part of what this work removes.
 Mutation testing becomes available as a dev dependency rather than a hand-rolled exercise. It is
 offered at the end, not mandated.
 
-### Staging
+### REQ-026 — The migration proceeds in independently revertible stages
+**Status:** active
 
 Each stage is independently verifiable and independently revertible. This matters because the
 project's own ledger records that eleven defects shipped past a fully green suite during the
@@ -378,7 +492,10 @@ where a behaviour change was requested, and the diff should be exactly one label
 
 Exactly one, and it is deliberate.
 
-**`--worktree` verifies the checkout is at the PR head.** Today the head SHA is never checked and
+### REQ-027 — `--worktree` verifies the checkout is at the PR head
+**Status:** active
+
+Today the head SHA is never checked and
 the section is labelled conservatively in all cases. The new behaviour verifies it, and on a
 mismatch **warns and degrades**: a note is recorded, the conservative label is applied, and the
 pack is still built. It does not reject — rejecting a stale checkout would violate the standing
