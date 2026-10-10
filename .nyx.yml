@@ -1,0 +1,1 @@
+engineering_standards: {"schema_version": 1, "framework_version": "1.4", "type": "cli", "status": "active", "deployment_target": "none", "database": "none", "lightweight": false, "optional_categories": [], "exemptions": []}
